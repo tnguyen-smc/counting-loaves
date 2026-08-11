@@ -73,6 +73,19 @@ function formatShortDate(dateStr) {
 }
 function uid(prefix) { return prefix + '_' + Math.random().toString(36).slice(2,9); }
 function classroomLabel(cls) { return cls ? (cls.grade + ' — ' + cls.teacher) : 'Unknown Classroom'; }
+const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+function monthNameOf(m) { return MONTH_NAMES[m - 1] || ''; }
+function daysInMonth(year, month) { return new Date(year, month, 0).getDate(); }
+// Maps a classroom's free-text "grade" value to an Elementary / Middle School / High School
+// band using the admin-configured settings.gradeBands map (Admin -> Grade Bands). Any grade
+// that hasn't been explicitly assigned yet defaults to "elementary" so nothing silently drops
+// out of the monthly report.
+function bandForGrade(settings, grade) {
+  const bands = (settings && settings.gradeBands) || {};
+  return bands[grade] || 'elementary';
+}
+const LUNCH_STATUS_LABELS = { paid: 'Paid', reduced: 'Reduced', free: 'Free' };
+function lunchStatusLabel(status) { return LUNCH_STATUS_LABELS[status] || 'Paid'; }
 function logId(dateStr, classroomId) { return dateStr + '__' + classroomId; }
 function studentName(s) { return s ? (s.firstName + ' ' + s.lastName) : ''; }
 function studentNumberOf(s) { return (s && s.number != null) ? s.number : 0; }
@@ -198,7 +211,13 @@ async function deleteClassroomDoc(id) { await db.collection('classrooms').doc(id
 
 async function saveStudent(s) {
   const id = s.id || uid('s');
-  await db.collection('students').doc(id).set({ number: s.number, firstName: s.firstName, lastName: s.lastName, classroomId: s.classroomId });
+  await db.collection('students').doc(id).set({
+    number: s.number,
+    firstName: s.firstName,
+    lastName: s.lastName,
+    classroomId: s.classroomId,
+    lunchStatus: s.lunchStatus || 'paid'
+  });
   return id;
 }
 async function deleteStudentDoc(id) { await db.collection('students').doc(id).delete(); }
@@ -260,64 +279,110 @@ function aggregateRangeByStudent(data, startDate, endDate) {
   return result;
 }
 
-/* ============================ EXPORT (EXCEL / CSV) ============================ */
-function csvEscape(v) {
-  const s = String(v == null ? '' : v);
-  if (/[",\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
-  return s;
-}
-function rowsToCSV(rows) { return rows.map(r => r.map(csvEscape).join(',')).join('\r\n'); }
-function downloadCSV(filename, rows) {
-  const csv = rowsToCSV(rows);
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = filename;
-  document.body.appendChild(a); a.click(); document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-function downloadXLSX(filename, rows) {
-  const ws = XLSX.utils.aoa_to_sheet(rows);
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, 'Lunch Count Export');
-  XLSX.writeFile(wb, filename);
-}
-
-function buildRangeExportRows(data, startDate, endDate, rangeLabel) {
-  const rows = [];
-  rows.push(['Lunch Count Export']);
-  rows.push(['Range', rangeLabel]);
-  rows.push(['Generated', formatDisplayDate(todayStr())]);
-  rows.push([]);
-  rows.push(['Classroom Summary (Final Counts Only)']);
-  rows.push(['Classroom', 'Grade', 'Teacher', 'Hot Lunch', 'Sack Lunch', 'Absent', 'Milk', 'Total Students']);
-
-  const agg = aggregateRange(data, startDate, endDate);
-  const grand = { hot: 0, sack: 0, absent: 0, milk: 0, total: 0 };
-
-  data.classrooms.forEach(cls => {
-    const roster = data.students.filter(s => s.classroomId === cls.id);
-    const v = agg[cls.id] || { hot: 0, sack: 0, absent: 0, milk: 0 };
-    rows.push([classroomLabel(cls), cls.grade, cls.teacher, v.hot, v.sack, v.absent, v.milk, roster.length]);
-    grand.hot += v.hot; grand.sack += v.sack; grand.absent += v.absent; grand.milk += v.milk;
-    grand.total += roster.length;
-  });
-  rows.push(['GRAND TOTAL', '', '', grand.hot, grand.sack, grand.absent, grand.milk, grand.total]);
-
-  rows.push([]);
-  rows.push(['Student-Level Detail (Final Counts Only)']);
-  rows.push(['Classroom', 'Grade', 'Teacher', 'Student #', 'First Name', 'Last Name', 'Hot Lunch', 'Sack Lunch', 'Absent Days', 'Milk']);
-
-  const studentAgg = aggregateRangeByStudent(data, startDate, endDate);
-  data.classrooms.forEach(cls => {
-    const roster = sortStudents(data.students.filter(s => s.classroomId === cls.id), 'number');
-    roster.forEach(s => {
-      const v = studentAgg[s.id] || { hot: 0, sack: 0, absent: 0, milk: 0 };
-      rows.push([classroomLabel(cls), cls.grade, cls.teacher, s.number, s.firstName, s.lastName, v.hot, v.sack, v.absent, v.milk]);
+/* ============================ MONTHLY MEAL COUNT EXPORT (matches official template) ============================ */
+// For every day of the given month, tallies how many *not-absent* students on submitted/final
+// logs fall into each reporting bucket: Elementary Paid, Middle School Paid, High School Paid,
+// Reduced Price, and Free. Grade band comes from settings.gradeBands (Admin -> Grade Bands);
+// reduced/free comes from each student's own lunchStatus (Admin -> Students).
+// Days with no submitted final log anywhere are left out entirely (null) so the exported sheet
+// leaves that day's row blank, exactly like the paper form would.
+function buildMonthlyMealCountDays(data, year, month) {
+  const numDays = daysInMonth(year, month);
+  const days = [];
+  for (let day = 1; day <= 31; day++) {
+    if (day > numDays) { days.push(null); continue; }
+    const dateStr = year + '-' + pad2(month) + '-' + pad2(day);
+    let hasData = false;
+    const counts = { elem: 0, mid: 0, high: 0, reduced: 0, free: 0 };
+    data.classrooms.forEach(cls => {
+      const log = data.logsById[logId(dateStr, cls.id)];
+      if (!log || !log.final || !log.final.submitted) return;
+      hasData = true;
+      const band = bandForGrade(data.settings, cls.grade);
+      const roster = data.students.filter(s => s.classroomId === cls.id);
+      roster.forEach(s => {
+        const e = (log.final.entries && log.final.entries[s.id]) || defaultEntry();
+        if (e.absent) return;
+        const status = s.lunchStatus || 'paid';
+        if (status === 'free') { counts.free++; return; }
+        if (status === 'reduced') { counts.reduced++; return; }
+        if (band === 'middle') counts.mid++;
+        else if (band === 'high') counts.high++;
+        else counts.elem++;
+      });
     });
-  });
+    days.push(hasData ? counts : null);
+  }
+  return days;
+}
 
-  return rows;
+// Builds a SheetJS workbook that mirrors the official monthly reimbursable meal count sheet:
+// same headers, same merged cells (Day of the Month / Student Lunches / Reimbursable), a Month
+// and Year field, one row per day 1-31 with live =SUM() formulas for Total Paid and Total, and
+// a Total row at the bottom that sums every column. Note: the free/community build of SheetJS
+// (loaded from the CDN) writes values, formulas, and merges faithfully, but it does not persist
+// cell styling (bold headers, borders) the way the original template file has them — the numbers
+// and formulas will match exactly, but you may want to re-apply borders/bold once opened in Excel.
+function buildMonthlyMealCountWorkbook(data, year, month) {
+  const days = buildMonthlyMealCountDays(data, year, month);
+  const ws = {};
+  function setCell(addr, value, isFormula) {
+    if (value === undefined || value === null) return;
+    if (isFormula) { ws[addr] = { t: 'n', f: value }; return; }
+    if (typeof value === 'number') { ws[addr] = { t: 'n', v: value }; return; }
+    ws[addr] = { t: 's', v: String(value) };
+  }
+
+  setCell('A1', 'Day of the Month');
+  setCell('B1', 'Student Lunches');
+  setCell('B2', 'Reimbursable');
+  setCell('I2', 'Month');
+  setCell('J2', monthNameOf(month));
+  setCell('K2', 'Year');
+  setCell('L2', year);
+  setCell('B3', 'Elem. School Paid');
+  setCell('C3', 'Middle School Paid');
+  setCell('D3', 'High School Paid');
+  setCell('E3', 'Total Paid');
+  setCell('F3', 'Reduced Price');
+  setCell('G3', 'Free');
+  setCell('H3', 'Total');
+
+  for (let day = 1; day <= 31; day++) {
+    const r = day + 3; // day 1 -> row 4, matching the template
+    setCell('A' + r, day);
+    const d = days[day - 1];
+    if (d) {
+      setCell('B' + r, d.elem);
+      setCell('C' + r, d.mid);
+      setCell('D' + r, d.high);
+      setCell('F' + r, d.reduced);
+      setCell('G' + r, d.free);
+    }
+    setCell('E' + r, 'SUM(B' + r + ':D' + r + ')', true);
+    setCell('H' + r, 'SUM(E' + r + ':G' + r + ')', true);
+  }
+
+  setCell('A35', 'Total');
+  ['B','C','D','E','F','G','H'].forEach(col => setCell(col + '35', 'SUM(' + col + '4:' + col + '34)', true));
+
+  ws['!ref'] = 'A1:L35';
+  ws['!merges'] = [
+    XLSX.utils.decode_range('B1:H1'),
+    XLSX.utils.decode_range('A1:A3'),
+    XLSX.utils.decode_range('B2:H2')
+  ];
+  ws['!cols'] = [{ wch: 14 }, { wch: 15 }, { wch: 17 }, { wch: 15 }, { wch: 11 }, { wch: 13 }, { wch: 9 }, { wch: 9 }];
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
+  return wb;
+}
+
+function downloadMonthlyMealCountXLSX(data, year, month) {
+  const wb = buildMonthlyMealCountWorkbook(data, year, month);
+  const filename = 'lunch-count-' + year + '-' + pad2(month) + '.xlsx';
+  XLSX.writeFile(wb, filename);
 }
 
 /* ============================ SMALL UI PRIMITIVES ============================ */
@@ -1389,12 +1454,65 @@ function TermSettingsPanel({ settings }) {
   );
 }
 
+/* ============================ ADMIN: GRADE BANDS ============================ */
+function GradeBandsPanel({ data }) {
+  const settings = data.settings;
+  const bands = settings.gradeBands || {};
+
+  const gradesInUse = useMemo(() => {
+    const set = new Set();
+    data.classrooms.forEach(c => { if (c.grade) set.add(c.grade); });
+    return Array.from(set).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  }, [data.classrooms]);
+
+  async function setBand(grade, band) {
+    const newBands = { ...bands, [grade]: band };
+    await saveSettings({ gradeBands: newBands });
+  }
+
+  const bandOptions = [['elementary', 'Elementary'], ['middle', 'Middle School'], ['high', 'High School']];
+
+  return (
+    <div>
+      <h3 className="text-xl font-bold text-primary-900 mb-4">Grade Bands</h3>
+      <p className="text-sm font-light text-primary-600 mb-4">
+        Assign each grade used by your classrooms to Elementary, Middle School, or High School.
+        This decides which "Paid" column a student's paid lunch counts toward on the Monthly Meal
+        Count Export. Any grade you haven't assigned yet defaults to Elementary.
+      </p>
+      <div className="grid gap-2">
+        {gradesInUse.length === 0 && (
+          <p className="text-sm font-light text-primary-500">No classrooms yet &mdash; add a classroom first in Admin &rarr; Classrooms.</p>
+        )}
+        {gradesInUse.map(grade => {
+          const current = bands[grade] || 'elementary';
+          return (
+            <div key={grade} className="bg-white rounded-2xl card-shadow border border-primary-100 p-4 flex items-center justify-between flex-wrap gap-3">
+              <p className="font-semibold text-primary-900">{grade}</p>
+              <div className="flex gap-2">
+                {bandOptions.map(([val, label]) => (
+                  <button
+                    key={val}
+                    onClick={() => setBand(grade, val)}
+                    className={"px-3 py-1.5 rounded-lg text-sm font-semibold border-2 transition-fast " + (current === val ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
+                  >{label}</button>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 /* ============================ ADMIN: STUDENT MANAGEMENT ============================ */
 function StudentManagement({ data }) {
   const [newNumber, setNewNumber] = useState('');
   const [newFirst, setNewFirst] = useState('');
   const [newLast, setNewLast] = useState('');
   const [newClass, setNewClass] = useState(data.classrooms[0] ? data.classrooms[0].id : '');
+  const [newLunchStatus, setNewLunchStatus] = useState('paid');
   const [editingId, setEditingId] = useState(null);
   const [editNumber, setEditNumber] = useState('');
   const [editFirst, setEditFirst] = useState('');
@@ -1417,8 +1535,8 @@ function StudentManagement({ data }) {
   async function addStudent(e) {
     e.preventDefault();
     if (!newNumber.trim() || !newFirst.trim() || !newLast.trim() || !newClass) return;
-    await saveStudent({ number: newNumber.trim(), firstName: newFirst.trim(), lastName: newLast.trim(), classroomId: newClass });
-    setNewNumber(''); setNewFirst(''); setNewLast('');
+    await saveStudent({ number: newNumber.trim(), firstName: newFirst.trim(), lastName: newLast.trim(), classroomId: newClass, lunchStatus: newLunchStatus });
+    setNewNumber(''); setNewFirst(''); setNewLast(''); setNewLunchStatus('paid');
   }
 
   async function deleteStudent(id) {
@@ -1429,7 +1547,14 @@ function StudentManagement({ data }) {
   async function moveStudent(id, classroomId) {
     const s = data.students.find(x => x.id === id);
     if (!s) return;
-    await saveStudent({ id, number: s.number, firstName: s.firstName, lastName: s.lastName, classroomId });
+    await saveStudent({ id, number: s.number, firstName: s.firstName, lastName: s.lastName, classroomId, lunchStatus: s.lunchStatus });
+  }
+
+  // Quick-set from the roster card, no need to enter edit mode just to annotate reduced/free.
+  async function setLunchStatus(id, status) {
+    const s = data.students.find(x => x.id === id);
+    if (!s) return;
+    await saveStudent({ id, number: s.number, firstName: s.firstName, lastName: s.lastName, classroomId: s.classroomId, lunchStatus: status });
   }
 
   function startEdit(s) { setEditingId(s.id); setEditNumber(String(s.number)); setEditFirst(s.firstName); setEditLast(s.lastName); }
@@ -1441,7 +1566,8 @@ function StudentManagement({ data }) {
       number: editNumber.trim() || s.number,
       firstName: editFirst.trim() || s.firstName,
       lastName: editLast.trim() || s.lastName,
-      classroomId: s.classroomId
+      classroomId: s.classroomId,
+      lunchStatus: s.lunchStatus
     });
     setEditingId(null);
   }
@@ -1478,6 +1604,7 @@ function StudentManagement({ data }) {
         const firstIdx = header.indexOf('first name');
         const lastIdx = header.indexOf('last name');
         const classroomIdx = header.indexOf('classroom');
+        const lunchStatusIdx = header.indexOf('lunch status'); // optional column
         if (numberIdx === -1 || firstIdx === -1 || lastIdx === -1 || classroomIdx === -1) {
           alert('The file must have a header row with columns: Student #, First Name, Last Name, Classroom');
           return;
@@ -1488,7 +1615,9 @@ function StudentManagement({ data }) {
           const lastName = String(r[lastIdx]).trim();
           const classroomVal = String(r[classroomIdx]).trim().toLowerCase();
           const match = data.classrooms.find(c => classroomLabel(c).trim().toLowerCase() === classroomVal);
-          return { number, firstName, lastName, classroomText: String(r[classroomIdx]).trim(), classroomId: match ? match.id : null };
+          const rawStatus = lunchStatusIdx !== -1 ? String(r[lunchStatusIdx]).trim().toLowerCase() : 'paid';
+          const lunchStatus = (rawStatus === 'reduced' || rawStatus === 'free') ? rawStatus : 'paid';
+          return { number, firstName, lastName, classroomText: String(r[classroomIdx]).trim(), classroomId: match ? match.id : null, lunchStatus };
         });
         setImportRows(parsed);
       } catch (err) {
@@ -1504,7 +1633,7 @@ function StudentManagement({ data }) {
     setImportBusy(true);
     const matched = importRows.filter(r => r.classroomId);
     for (const r of matched) {
-      await saveStudent({ number: r.number, firstName: r.firstName, lastName: r.lastName, classroomId: r.classroomId });
+      await saveStudent({ number: r.number, firstName: r.firstName, lastName: r.lastName, classroomId: r.classroomId, lunchStatus: r.lunchStatus });
     }
     setImportBusy(false);
     setImportRows(null);
@@ -1538,13 +1667,21 @@ function StudentManagement({ data }) {
               {data.classrooms.map(c => <option key={c.id} value={c.id}>{classroomLabel(c)}</option>)}
             </select>
           </div>
+          <div>
+            <label className="text-xs font-medium text-primary-500 uppercase">Lunch Status</label>
+            <select value={newLunchStatus} onChange={e => setNewLunchStatus(e.target.value)} className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary">
+              <option value="paid">Paid</option>
+              <option value="reduced">Reduced</option>
+              <option value="free">Free</option>
+            </select>
+          </div>
           <PrimaryButton type="submit">Add Student</PrimaryButton>
         </form>
       )}
 
       <div className="bg-white rounded-2xl card-shadow p-4 border border-primary-100 mb-6">
         <p className="text-sm font-semibold text-primary-800 mb-2">Batch Upload Roster (CSV or Excel)</p>
-        <p className="text-xs font-light text-primary-500 mb-3">File must include a header row with columns named exactly: <span className="font-semibold">Student #</span>, <span className="font-semibold">First Name</span>, <span className="font-semibold">Last Name</span>, <span className="font-semibold">Classroom</span>. Classroom must match an existing classroom's "Grade — Teacher" label exactly.</p>
+        <p className="text-xs font-light text-primary-500 mb-3">File must include a header row with columns named exactly: <span className="font-semibold">Student #</span>, <span className="font-semibold">First Name</span>, <span className="font-semibold">Last Name</span>, <span className="font-semibold">Classroom</span>. Classroom must match an existing classroom's "Grade — Teacher" label exactly. You can optionally add a <span className="font-semibold">Lunch Status</span> column with values <span className="font-semibold">Paid</span>, <span className="font-semibold">Reduced</span>, or <span className="font-semibold">Free</span> &mdash; anything left blank or unrecognized imports as Paid.</p>
         <input ref={fileInputRef} type="file" accept=".csv,.xlsx,.xls" onChange={handleFileSelected} className="text-sm" />
         {importRows && (
           <div className="mt-4 border border-primary-100 rounded-xl overflow-hidden overflow-x-auto">
@@ -1555,6 +1692,7 @@ function StudentManagement({ data }) {
                   <th className="p-2 font-semibold">First Name</th>
                   <th className="p-2 font-semibold">Last Name</th>
                   <th className="p-2 font-semibold">Classroom</th>
+                  <th className="p-2 font-semibold">Lunch Status</th>
                   <th className="p-2 font-semibold">Match</th>
                 </tr>
               </thead>
@@ -1565,6 +1703,7 @@ function StudentManagement({ data }) {
                     <td className="p-2">{r.firstName}</td>
                     <td className="p-2">{r.lastName}</td>
                     <td className="p-2">{r.classroomText}</td>
+                    <td className="p-2">{lunchStatusLabel(r.lunchStatus)}</td>
                     <td className="p-2">{r.classroomId ? <span className="text-green-700 font-semibold">Matched</span> : <span className="text-rose-600 font-semibold">No matching classroom</span>}</td>
                   </tr>
                 ))}
@@ -1637,6 +1776,20 @@ function StudentManagement({ data }) {
                     >
                       {data.classrooms.map(cc => <option key={cc.id} value={cc.id}>{classroomLabel(cc)}</option>)}
                     </select>
+                    <div className="flex gap-1">
+                      {[['paid','Paid','bg-primary-50 text-primary border-primary-200'],['reduced','Reduced','bg-amber-50 text-amber-700 border-amber-300'],['free','Free','bg-green-50 text-green-700 border-green-300']].map(([val,label,activeClass]) => {
+                        const current = s.lunchStatus || 'paid';
+                        const isActive = current === val;
+                        return (
+                          <button
+                            key={val}
+                            onClick={() => setLunchStatus(s.id, val)}
+                            title={"Mark as " + label + " lunch"}
+                            className={"px-2.5 py-1.5 rounded-lg text-xs font-semibold border-2 transition-fast " + (isActive ? activeClass : 'bg-white text-primary-400 border-primary-100 hover:bg-primary-50')}
+                          >{label}</button>
+                        );
+                      })}
+                    </div>
                     {editingId === s.id ? (
                       <button onClick={() => saveEdit(s.id)} className="px-3 py-1.5 rounded-lg bg-primary text-white text-sm font-semibold">Save</button>
                     ) : (
@@ -1731,112 +1884,57 @@ function ClassroomManagement({ data }) {
 
 /* ============================ ADMIN: EXPORT ============================ */
 function ExportPanel({ data }) {
-  const [rangeType, setRangeType] = useState('daily');
-  const [dateVal, setDateVal] = useState(todayStr());
-  const [monthVal, setMonthVal] = useState(todayStr().slice(0,7));
-  const [termKey, setTermKey] = useState('Q1');
-  const [customStart, setCustomStart] = useState(todayStr());
-  const [customEnd, setCustomEnd] = useState(todayStr());
-  const [format, setFormat] = useState('xlsx');
+  const now = new Date();
+  const [year, setYear] = useState(now.getFullYear());
+  const [month, setMonth] = useState(now.getMonth() + 1);
 
-  const rangeOptions = [
-    ['daily','Daily'],
-    ['weekly','Weekly'],
-    ['monthly','Monthly'],
-    ['quarter','By Quarter'],
-    ['semester','By Semester'],
-    ['schoolyear','By School Year'],
-    ['ytd','Start of School Year to Now'],
-    ['custom','Custom Date Range']
-  ];
+  const yearOptions = [];
+  for (let y = now.getFullYear() - 2; y <= now.getFullYear() + 1; y++) yearOptions.push(y);
 
-  function computeRange() {
-    if (rangeType === 'daily') {
-      const d = parseDateStr(dateVal);
-      return { start: d, end: d, label: formatDisplayDate(dateVal), filePart: dateVal };
-    }
-    if (rangeType === 'weekly') {
-      const wr = getWeekRange(dateVal);
-      return { start: wr.start, end: wr.end, label: 'Week of ' + formatShortDate(toDateStr(wr.start)), filePart: 'week-' + toDateStr(wr.start) };
-    }
-    if (rangeType === 'monthly') {
-      const mr = getMonthRange(monthVal);
-      return { start: mr.start, end: mr.end, label: mr.start.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }), filePart: monthVal };
-    }
-    if (rangeType === 'quarter' || rangeType === 'semester') {
-      const r = getTermRange(data.settings, termKey);
-      if (!r) return null;
-      return { start: r.start, end: r.end, label: TERM_LABELS[termKey], filePart: termKey };
-    }
-    if (rangeType === 'schoolyear') {
-      const r = getSchoolYearRange(data.settings);
-      if (!r) return null;
-      return { start: r.start, end: r.end, label: 'Full School Year', filePart: 'school-year' };
-    }
-    if (rangeType === 'ytd') {
-      const r = getStartOfYearToNow(data.settings);
-      if (!r) return null;
-      return { start: r.start, end: r.end, label: 'Start of School Year \u2013 Today', filePart: 'ytd' };
-    }
-    let s = parseDateStr(customStart), e = parseDateStr(customEnd);
-    if (e < s) e = s;
-    return { start: s, end: e, label: formatShortDate(customStart) + ' \u2013 ' + formatShortDate(toDateStr(e)), filePart: customStart + '_to_' + toDateStr(e) };
-  }
+  const preview = useMemo(() => buildMonthlyMealCountDays(data, year, month), [data, year, month]);
+  const daysWithData = preview.filter(Boolean).length;
 
   function runExport() {
-    const r = computeRange();
-    if (!r) { alert('That date range has not been configured yet. Set it in Admin \u2192 Term Settings.'); return; }
-    const rows = buildRangeExportRows(data, r.start, r.end, r.label);
-    const filename = 'lunch-count-export-' + r.filePart;
-    if (format === 'xlsx') downloadXLSX(filename + '.xlsx', rows);
-    else downloadCSV(filename + '.csv', rows);
+    downloadMonthlyMealCountXLSX(data, year, month);
   }
 
   return (
     <div>
-      <h3 className="text-xl font-bold text-primary-900 mb-4">Lunch Count Export</h3>
-      <p className="text-sm font-light text-primary-600 mb-6">Choose a date range and download a classroom-by-classroom and student-by-student breakdown of final lunch counts.</p>
+      <h3 className="text-xl font-bold text-primary-900 mb-4">Monthly Meal Count Export</h3>
+      <p className="text-sm font-light text-primary-600 mb-6">
+        Pick a month and year to download the reimbursable meal count report in the exact layout of
+        your official monthly form &mdash; Elementary / Middle / High School Paid, Reduced Price, Free,
+        and Total, one row per day, with the same live formulas.
+      </p>
 
       <div className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
-        <p className="text-xs font-semibold text-primary-500 uppercase mb-2">Date Range</p>
-        <div className="flex flex-wrap gap-2 mb-4">
-          {rangeOptions.map(([val,label]) => (
-            <button
-              key={val}
-              onClick={() => setRangeType(val)}
-              className={"px-4 py-2 rounded-xl font-semibold text-sm border-2 transition-fast " + (rangeType === val ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
-            >{label}</button>
-          ))}
+        <div className="flex flex-wrap gap-4 items-end mb-4">
+          <div>
+            <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Month</label>
+            <select value={month} onChange={e => setMonth(Number(e.target.value))} className="border-2 border-primary-200 rounded-xl px-3 py-2">
+              {Array.from({ length: 12 }, (_, i) => i + 1).map(m => (
+                <option key={m} value={m}>{monthNameOf(m)}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Year</label>
+            <select value={year} onChange={e => setYear(Number(e.target.value))} className="border-2 border-primary-200 rounded-xl px-3 py-2">
+              {yearOptions.map(y => <option key={y} value={y}>{y}</option>)}
+            </select>
+          </div>
+          <PrimaryButton onClick={runExport}>Download Monthly Report</PrimaryButton>
         </div>
-
-        <div className="flex flex-wrap gap-3 items-center mb-4">
-          {rangeType === 'daily' && <input type="date" value={dateVal} onChange={e => setDateVal(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />}
-          {rangeType === 'weekly' && <input type="date" value={dateVal} onChange={e => setDateVal(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />}
-          {rangeType === 'monthly' && <input type="month" value={monthVal} onChange={e => setMonthVal(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />}
-          {rangeType === 'quarter' && ['Q1','Q2','Q3','Q4'].map(k => (
-            <button key={k} onClick={() => setTermKey(k)} className={"px-3 py-1.5 rounded-lg text-sm font-semibold border-2 " + (termKey === k ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>{k}</button>
-          ))}
-          {rangeType === 'semester' && ['S1','S2'].map(k => (
-            <button key={k} onClick={() => setTermKey(k)} className={"px-3 py-1.5 rounded-lg text-sm font-semibold border-2 " + (termKey === k ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>{k}</button>
-          ))}
-          {rangeType === 'custom' && (
-            <React.Fragment>
-              <input type="date" value={customStart} onChange={e => setCustomStart(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
-              <span className="text-sm text-primary-500">to</span>
-              <input type="date" value={customEnd} onChange={e => setCustomEnd(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
-            </React.Fragment>
-          )}
-        </div>
-
-        <p className="text-xs font-semibold text-primary-500 uppercase mb-2">File Format</p>
-        <div className="flex gap-2 mb-5">
-          {[['xlsx','Excel (.xlsx)'],['csv','CSV (.csv)']].map(([val,label]) => (
-            <button key={val} onClick={() => setFormat(val)} className={"px-4 py-2 rounded-xl font-semibold text-sm border-2 transition-fast " + (format === val ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}>{label}</button>
-          ))}
-        </div>
-
-        <PrimaryButton onClick={runExport}>Download Export</PrimaryButton>
+        <p className="text-xs font-light text-primary-500">
+          {daysWithData} of {daysInMonth(year, month)} day{daysInMonth(year, month) === 1 ? '' : 's'} in {monthNameOf(month)} {year} have a final, submitted count so far.
+          Days without a submitted count are left blank in the export, just like the paper form.
+        </p>
       </div>
+
+      <p className="text-xs font-light text-primary-400 mt-3">
+        Elementary / Middle / High School bands come from Admin &rarr; Grade Bands. Reduced and Free
+        counts come from each student's lunch status, set in Admin &rarr; Students.
+      </p>
     </div>
   );
 }
@@ -1849,6 +1947,7 @@ function AdminPanel({ data, authUser, onLogout }) {
     ['verification', 'Verification'],
     ['classrooms', 'Classrooms'],
     ['students', 'Students'],
+    ['gradebands', 'Grade Bands'],
     ['settings', 'Term Settings'],
     ['export', 'Export']
   ];
@@ -1875,6 +1974,7 @@ function AdminPanel({ data, authUser, onLogout }) {
       {tab === 'verification' && <VerificationPanel data={data} />}
       {tab === 'classrooms' && <ClassroomManagement data={data} />}
       {tab === 'students' && <StudentManagement data={data} />}
+      {tab === 'gradebands' && <GradeBandsPanel data={data} />}
       {tab === 'settings' && <TermSettingsPanel settings={data.settings} />}
       {tab === 'export' && <ExportPanel data={data} />}
     </div>
