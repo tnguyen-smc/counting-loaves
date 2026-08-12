@@ -242,6 +242,91 @@ async function saveLogFull(dateStr, classroomId, obj) {
   await db.collection('logs').doc(id).set(payload);
 }
 
+/* ============================ ADMIN DATA MANAGEMENT (delete / edit historical counts) ============================ */
+// Everything below writes to the same "logs" collection that powers Analytics and the Monthly
+// Meal Count Export. Because both of those read live Firestore data on every render, deleting or
+// editing records here is automatically reflected there — no separate "recalculate" step needed.
+
+async function deleteLogDoc(id) { await db.collection('logs').doc(id).delete(); }
+
+// Returns every log whose date falls within [startDate, endDate], optionally restricted to a
+// single classroom. Pass classroomId = null (or '') to match all classrooms.
+function findLogsInRange(data, startDate, endDate, classroomId) {
+  return data.logs.filter(log => {
+    const d = parseDateStr(log.date);
+    if (d < startDate || d > endDate) return false;
+    if (classroomId && log.classroomId !== classroomId) return false;
+    return true;
+  });
+}
+
+async function clearPreCountForLogs(logs) {
+  for (const log of logs) {
+    await saveLogFull(log.date, log.classroomId, {
+      pre: { entries: {}, submitted: false, submittedAt: null },
+      final: log.final,
+      verified: log.verified,
+      verifiedAt: log.verifiedAt
+    });
+  }
+}
+
+// Clearing the final count also un-verifies the day, since a verified count with no final
+// data behind it would be misleading in Analytics/Export.
+async function clearFinalCountForLogs(logs) {
+  for (const log of logs) {
+    await saveLogFull(log.date, log.classroomId, {
+      pre: log.pre,
+      final: { entries: {}, submitted: false, submittedAt: null },
+      verified: false,
+      verifiedAt: null
+    });
+  }
+}
+
+async function deleteWholeLogs(logs) {
+  for (const log of logs) {
+    await deleteLogDoc(logId(log.date, log.classroomId));
+  }
+}
+
+// Removes a single student's entry from the pre and/or final entries of every matching log,
+// without touching any other student's data in that same log. This is the "fix one kid's
+// mistake" tool, as opposed to the bulk deletes above which wipe a whole classroom-day.
+async function clearStudentFromLogs(logs, studentId, target) {
+  for (const log of logs) {
+    const basePre = log.pre || { entries: {}, submitted: false, submittedAt: null };
+    const baseFinal = log.final || { entries: {}, submitted: false, submittedAt: null };
+    const newPre = { ...basePre, entries: { ...(basePre.entries || {}) } };
+    const newFinal = { ...baseFinal, entries: { ...(baseFinal.entries || {}) } };
+    let finalTouched = false;
+    if (target === 'pre' || target === 'both') delete newPre.entries[studentId];
+    if (target === 'final' || target === 'both') { delete newFinal.entries[studentId]; finalTouched = true; }
+    await saveLogFull(log.date, log.classroomId, {
+      pre: newPre,
+      final: newFinal,
+      verified: finalTouched ? false : log.verified,
+      verifiedAt: finalTouched ? null : log.verifiedAt
+    });
+  }
+}
+
+// Bulk end-of-year promotion: moves every student currently in fromClassroomId to
+// toClassroomId, or deletes the student doc entirely when toClassroomId is null (e.g.
+// graduating 8th graders off the roster). Historical logs intentionally keep referencing the
+// OLD classroomId, so past years' reports and exports stay accurate after the move.
+async function promoteClassroom(data, fromClassroomId, toClassroomId) {
+  const roster = data.students.filter(s => s.classroomId === fromClassroomId);
+  for (const s of roster) {
+    if (toClassroomId) {
+      await saveStudent({ id: s.id, number: s.number, firstName: s.firstName, lastName: s.lastName, classroomId: toClassroomId, lunchStatus: s.lunchStatus });
+    } else {
+      await deleteStudentDoc(s.id);
+    }
+  }
+  return roster.length;
+}
+
 /* ============================ AGGREGATION (ANALYTICS + EXPORT) ============================ */
 function aggregateRange(data, startDate, endDate) {
   const result = {};
@@ -285,7 +370,9 @@ function aggregateRangeByStudent(data, startDate, endDate) {
 // Reduced Price, and Free. Grade band comes from settings.gradeBands (Admin -> Grade Bands);
 // reduced/free comes from each student's own lunchStatus (Admin -> Students).
 // Days with no submitted final log anywhere are left out entirely (null) so the exported sheet
-// leaves that day's row blank, exactly like the paper form would.
+// leaves that day's row blank, exactly like the paper form would. Because this reads straight
+// from data.logsById / data.students (live Firestore data), anything deleted or edited in Admin
+// -> Data Management is reflected here automatically the next time this is computed.
 function buildMonthlyMealCountDays(data, year, month) {
   const numDays = daysInMonth(year, month);
   const days = [];
@@ -437,6 +524,21 @@ function GhostButton({ children, onClick, className, type }) {
       type={type || 'button'}
       onClick={onClick}
       className={"btn-touch px-5 py-3 rounded-xl bg-white text-primary font-semibold text-base border-2 border-primary-200 transition-fast hover:bg-primary-50 active:scale-[0.98] " + (className || '')}
+    >
+      {children}
+    </button>
+  );
+}
+
+// Reserved for destructive actions (bulk deletes) so they're visually distinct from the
+// everyday primary/ghost buttons used everywhere else.
+function DangerButton({ children, onClick, disabled, className }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={"btn-touch px-5 py-3 rounded-xl bg-rose-600 text-white font-semibold text-base transition-fast hover:bg-rose-700 active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed " + (className || '')}
     >
       {children}
     </button>
@@ -1904,7 +2006,9 @@ function ExportPanel({ data }) {
       <p className="text-sm font-light text-primary-600 mb-6">
         Pick a month and year to download the reimbursable meal count report in the exact layout of
         your official monthly form &mdash; Elementary / Middle / High School Paid, Reduced Price, Free,
-        and Total, one row per day, with the same live formulas.
+        and Total, one row per day, with the same live formulas. This always reflects the current
+        saved data, so anything deleted or corrected in Admin &rarr; Data Management is already
+        accounted for before you download.
       </p>
 
       <div className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
@@ -1939,6 +2043,365 @@ function ExportPanel({ data }) {
   );
 }
 
+/* ============================ ADMIN: DATA MANAGEMENT (delete / fix counts) ============================ */
+// Bulk delete/reset for a whole scope (day/week/month/quarter/semester/custom range), for one
+// classroom or all classrooms. Uses the same range pickers as Analytics for a familiar feel.
+function DataManagementPanel({ data }) {
+  const [scope, setScope] = useState('daily');
+  const [dateVal, setDateVal] = useState(todayStr());
+  const [monthVal, setMonthVal] = useState(todayStr().slice(0, 7));
+  const [termKey, setTermKey] = useState('Q1');
+  const [customStart, setCustomStart] = useState(todayStr());
+  const [customEnd, setCustomEnd] = useState(todayStr());
+  const [classroomId, setClassroomId] = useState('');
+  const [target, setTarget] = useState('both');
+  const [includeVerified, setIncludeVerified] = useState(false);
+  const [preview, setPreview] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  function resetPreview() { setPreview(null); }
+
+  function resolveRange() {
+    if (scope === 'daily') return { start: parseDateStr(dateVal), end: parseDateStr(dateVal), label: formatDisplayDate(dateVal) };
+    if (scope === 'weekly') {
+      const r = getWeekRange(dateVal);
+      return { start: r.start, end: r.end, label: formatShortDate(toDateStr(r.start)) + ' – ' + formatShortDate(toDateStr(r.end)) };
+    }
+    if (scope === 'monthly') {
+      const r = getMonthRange(monthVal);
+      return { start: r.start, end: r.end, label: r.start.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) };
+    }
+    if (scope === 'quarter' || scope === 'semester') {
+      const r = getTermRange(data.settings, termKey);
+      if (!r) return null;
+      return { start: r.start, end: r.end, label: TERM_LABELS[termKey] + ': ' + formatShortDate(toDateStr(r.start)) + ' – ' + formatShortDate(toDateStr(r.end)) };
+    }
+    const start = parseDateStr(customStart);
+    let end = parseDateStr(customEnd);
+    if (end < start) end = start;
+    return { start, end, label: formatShortDate(customStart) + ' – ' + formatShortDate(toDateStr(end)) };
+  }
+
+  function runPreview() {
+    const range = resolveRange();
+    if (!range) { alert('No dates set for ' + TERM_LABELS[termKey] + ' yet. Set them in Admin \u2192 Term Settings.'); return; }
+    let matches = findLogsInRange(data, range.start, range.end, classroomId || null);
+    if (!includeVerified) matches = matches.filter(l => !l.verified);
+    setPreview({ range, matches });
+  }
+
+  async function runDelete() {
+    if (!preview || preview.matches.length === 0) return;
+    const verifiedCount = preview.matches.filter(l => l.verified).length;
+    const what = target === 'both' ? "the entire day's record" : (target === 'pre' ? 'the morning pre-count' : 'the lunchtime final count');
+    const msg = 'This will permanently delete ' + what + ' for ' + preview.matches.length +
+      ' classroom-day record(s) in ' + preview.range.label +
+      (verifiedCount ? ' (including ' + verifiedCount + ' already verified/finalized)' : '') +
+      '. This cannot be undone. Continue?';
+    if (!confirm(msg)) return;
+    setBusy(true);
+    if (target === 'both') await deleteWholeLogs(preview.matches);
+    else if (target === 'pre') await clearPreCountForLogs(preview.matches);
+    else await clearFinalCountForLogs(preview.matches);
+    setBusy(false);
+    setPreview(null);
+    alert('Done. Analytics and the Monthly Meal Count Export will reflect this immediately.');
+  }
+
+  return (
+    <div>
+      <h3 className="text-xl font-bold text-primary-900 mb-4">Delete or Reset Count Data</h3>
+      <p className="text-sm font-light text-primary-600 mb-4">
+        Remove lunch count data for a day, week, month, quarter, or semester &mdash; for one
+        classroom or all of them at once. Analytics and the Monthly Meal Count Export always read
+        the latest saved data, so they update automatically once something is removed here.
+      </p>
+
+      <div className="flex flex-wrap gap-2 mb-4">
+        {[['daily', 'Day'], ['weekly', 'Week'], ['monthly', 'Month'], ['quarter', 'Quarter'], ['semester', 'Semester'], ['custom', 'Custom Range']].map(([val, label]) => (
+          <button key={val} onClick={() => { setScope(val); resetPreview(); }} className={"px-4 py-2 rounded-xl font-semibold text-sm border-2 transition-fast " + (scope === val ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}>{label}</button>
+        ))}
+      </div>
+
+      <div className="flex items-center gap-2 flex-wrap mb-4">
+        {(scope === 'daily' || scope === 'weekly') && (
+          <input type="date" value={dateVal} onChange={e => { setDateVal(e.target.value); resetPreview(); }} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
+        )}
+        {scope === 'monthly' && (
+          <input type="month" value={monthVal} onChange={e => { setMonthVal(e.target.value); resetPreview(); }} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
+        )}
+        {scope === 'quarter' && ['Q1', 'Q2', 'Q3', 'Q4'].map(k => (
+          <button key={k} onClick={() => { setTermKey(k); resetPreview(); }} className={"px-3 py-1.5 rounded-lg text-sm font-semibold border-2 " + (termKey === k ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>{k}</button>
+        ))}
+        {scope === 'semester' && ['S1', 'S2'].map(k => (
+          <button key={k} onClick={() => { setTermKey(k); resetPreview(); }} className={"px-3 py-1.5 rounded-lg text-sm font-semibold border-2 " + (termKey === k ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>{k}</button>
+        ))}
+        {scope === 'custom' && (
+          <React.Fragment>
+            <input type="date" value={customStart} onChange={e => { setCustomStart(e.target.value); resetPreview(); }} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
+            <span className="text-sm text-primary-500">to</span>
+            <input type="date" value={customEnd} onChange={e => { setCustomEnd(e.target.value); resetPreview(); }} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
+          </React.Fragment>
+        )}
+      </div>
+
+      <div className="flex flex-wrap gap-4 items-end mb-4">
+        <div>
+          <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Classroom</label>
+          <select value={classroomId} onChange={e => { setClassroomId(e.target.value); resetPreview(); }} className="border-2 border-primary-200 rounded-xl px-3 py-2">
+            <option value="">All Classrooms</option>
+            {data.classrooms.map(c => <option key={c.id} value={c.id}>{classroomLabel(c)}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="text-xs font-medium text-primary-500 uppercase block mb-1">What to Remove</label>
+          <select value={target} onChange={e => { setTarget(e.target.value); resetPreview(); }} className="border-2 border-primary-200 rounded-xl px-3 py-2">
+            <option value="both">Both (delete entire day's record)</option>
+            <option value="pre">Morning Pre-Count only</option>
+            <option value="final">Lunchtime Final Count only</option>
+          </select>
+        </div>
+        <label className="flex items-center gap-2 text-sm text-primary-700 font-medium pb-2">
+          <input type="checkbox" checked={includeVerified} onChange={e => { setIncludeVerified(e.target.checked); resetPreview(); }} />
+          Include already-verified/finalized days
+        </label>
+        <GhostButton onClick={runPreview}>Preview Matches</GhostButton>
+      </div>
+
+      {preview && (
+        <div className="bg-white rounded-2xl card-shadow border border-primary-100 p-4">
+          {preview.matches.length === 0 ? (
+            <p className="text-sm font-light text-primary-500">No matching records found for {preview.range.label}.</p>
+          ) : (
+            <React.Fragment>
+              <p className="text-sm font-semibold text-primary-800 mb-2">{preview.matches.length} classroom-day record(s) match in {preview.range.label}:</p>
+              <ul className="text-sm text-primary-700 font-light max-h-48 overflow-y-auto mb-4 list-disc list-inside">
+                {preview.matches.map(l => {
+                  const cls = data.classrooms.find(c => c.id === l.classroomId);
+                  return <li key={l.id}>{formatShortDate(l.date)} &mdash; {classroomLabel(cls)}{l.verified ? ' (Verified)' : ''}</li>;
+                })}
+              </ul>
+              <DangerButton disabled={busy} onClick={runDelete}>{busy ? 'Deleting…' : 'Delete Matching Data'}</DangerButton>
+            </React.Fragment>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Fix-one-record tool: pick a classroom + student + date and edit or remove just that
+// student's pre-count / final-count entry, without touching anyone else's data for that day.
+function StudentRecordEditor({ data }) {
+  const [classroomId, setClassroomId] = useState(data.classrooms[0] ? data.classrooms[0].id : '');
+  const [studentId, setStudentId] = useState('');
+  const [dateVal, setDateVal] = useState(todayStr());
+  const [busy, setBusy] = useState(false);
+
+  const roster = useMemo(() => sortStudents(data.students.filter(s => s.classroomId === classroomId), 'number'), [data.students, classroomId]);
+
+  useEffect(() => {
+    if (roster.length && !roster.some(s => s.id === studentId)) setStudentId(roster[0].id);
+    if (!roster.length) setStudentId('');
+    // eslint-disable-next-line
+  }, [classroomId, data.students]);
+
+  const log = data.logsById[logId(dateVal, classroomId)];
+  const preEntry = (log && log.pre && log.pre.entries && log.pre.entries[studentId]) || null;
+  const finalEntry = (log && log.final && log.final.entries && log.final.entries[studentId]) || null;
+
+  async function saveEntry(stageKey, entry) {
+    if (!log) { alert("There is no saved record for this classroom on this date yet."); return; }
+    setBusy(true);
+    const basePre = log.pre || { entries: {}, submitted: false, submittedAt: null };
+    const baseFinal = log.final || { entries: {}, submitted: false, submittedAt: null };
+    if (stageKey === 'pre') {
+      await saveLogFull(dateVal, classroomId, {
+        pre: { ...basePre, entries: { ...basePre.entries, [studentId]: entry } },
+        final: baseFinal,
+        verified: log.verified,
+        verifiedAt: log.verifiedAt
+      });
+    } else {
+      await saveLogFull(dateVal, classroomId, {
+        pre: basePre,
+        final: { ...baseFinal, entries: { ...baseFinal.entries, [studentId]: entry } },
+        verified: false,
+        verifiedAt: null
+      });
+    }
+    setBusy(false);
+  }
+
+  async function clearEntry(stageKey) {
+    if (!log) return;
+    if (!confirm("Remove this student's " + (stageKey === 'pre' ? 'morning pre-count' : 'lunchtime final count') + ' entry for this day?')) return;
+    setBusy(true);
+    await clearStudentFromLogs([log], studentId, stageKey);
+    setBusy(false);
+  }
+
+  function EntryEditor({ label, entry, stageKey }) {
+    const e = entry || defaultEntry();
+    return (
+      <div className="bg-primary-50 rounded-xl p-4">
+        <p className="text-xs font-semibold text-primary-700 uppercase mb-2">{label}{!entry && ' (no entry saved)'}</p>
+        <div className="flex flex-wrap gap-2">
+          <button onClick={() => saveEntry(stageKey, { ...e, absent: !e.absent })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (e.absent ? 'bg-rose-600 text-white border-rose-600' : 'bg-white text-rose-600 border-rose-200')}>
+            {e.absent ? 'Absent' : 'Mark Absent'}
+          </button>
+          {!e.absent && (
+            <React.Fragment>
+              <button onClick={() => saveEntry(stageKey, { ...e, meal: 'hot', milk: e.milk === 'no' ? 'no' : 'yes' })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (e.meal === 'hot' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>Hot Lunch</button>
+              <button onClick={() => saveEntry(stageKey, { ...e, meal: 'sack' })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (e.meal === 'sack' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>Sack Lunch</button>
+              <button onClick={() => saveEntry(stageKey, { ...e, milk: e.milk === 'yes' ? 'no' : 'yes' })} className="px-3 py-1.5 rounded-lg text-xs font-semibold border-2 bg-white text-primary-700 border-primary-200">
+                Milk: {e.milk === 'yes' ? 'Yes' : 'No'} (tap to toggle)
+              </button>
+            </React.Fragment>
+          )}
+          {entry && <button onClick={() => clearEntry(stageKey)} className="px-3 py-1.5 rounded-lg text-xs font-semibold border-2 bg-white text-rose-600 border-rose-200">Remove Entry</button>}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <h3 className="text-xl font-bold text-primary-900 mb-4">Edit or Remove One Student's Record</h3>
+      <p className="text-sm font-light text-primary-600 mb-4">
+        Fix a mistake for a single student on a single day without touching anyone else's counts.
+        Editing the lunchtime final count automatically un-verifies that day, so it's clear the
+        finalized number changed.
+      </p>
+      <div className="flex flex-wrap gap-4 items-end mb-4">
+        <div>
+          <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Classroom</label>
+          <select value={classroomId} onChange={e => setClassroomId(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2">
+            {data.classrooms.map(c => <option key={c.id} value={c.id}>{classroomLabel(c)}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Student</label>
+          <select value={studentId} onChange={e => setStudentId(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2">
+            {roster.map(s => <option key={s.id} value={s.id}>#{s.number} {s.firstName} {s.lastName}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Date</label>
+          <input type="date" value={dateVal} onChange={e => setDateVal(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
+        </div>
+      </div>
+
+      {!log ? (
+        <p className="text-sm font-light text-primary-500">No record exists for this classroom on {formatShortDate(dateVal)}.</p>
+      ) : !studentId ? (
+        <p className="text-sm font-light text-primary-500">This classroom has no students yet.</p>
+      ) : (
+        <div className="grid sm:grid-cols-2 gap-4">
+          <EntryEditor label="Morning Pre-Count" entry={preEntry} stageKey="pre" />
+          <EntryEditor label="Lunchtime Final Count" entry={finalEntry} stageKey="final" />
+        </div>
+      )}
+      {busy && <p className="text-xs text-primary-400 mt-2">Saving…</p>}
+    </div>
+  );
+}
+
+function DataManagementTab({ data }) {
+  return (
+    <div>
+      <DataManagementPanel data={data} />
+      <hr className="my-10 border-primary-100" />
+      <StudentRecordEditor data={data} />
+    </div>
+  );
+}
+
+/* ============================ ADMIN: PROMOTE STUDENTS (end-of-year rollover) ============================ */
+function PromoteStudentsPanel({ data }) {
+  const sortedClassrooms = useMemo(() => data.classrooms.slice().sort((a, b) => a.grade.localeCompare(b.grade, undefined, { numeric: true })), [data.classrooms]);
+  const [targets, setTargets] = useState({}); // classroomId -> 'keep' | otherClassroomId | 'graduate'
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+
+  function setTarget(fromId, val) { setResult(null); setTargets(prev => ({ ...prev, [fromId]: val })); }
+
+  const plan = sortedClassrooms
+    .map(c => ({ from: c, to: targets[c.id] || 'keep' }))
+    .filter(p => p.to !== 'keep');
+
+  async function applyPromotion() {
+    if (plan.length === 0) { alert('Choose at least one classroom to promote.'); return; }
+    const lines = plan.map(p => {
+      const count = data.students.filter(s => s.classroomId === p.from.id).length;
+      const toLabel = p.to === 'graduate' ? 'Remove from roster (graduating)' : classroomLabel(data.classrooms.find(c => c.id === p.to));
+      return classroomLabel(p.from) + ' (' + count + ' students) \u2192 ' + toLabel;
+    });
+    const confirmed = confirm(
+      "This will move students for the school year rollover:\n\n" + lines.join('\n') +
+      "\n\nPast lunch counts stay attached to the classroom they were recorded under, so historical Analytics and exports for prior dates are unaffected. Continue?"
+    );
+    if (!confirmed) return;
+    setBusy(true);
+    const summary = [];
+    for (const p of plan) {
+      const count = await promoteClassroom(data, p.from.id, p.to === 'graduate' ? null : p.to);
+      summary.push(classroomLabel(p.from) + ': ' + count + ' student(s) moved');
+    }
+    setBusy(false);
+    setResult(summary);
+    setTargets({});
+  }
+
+  return (
+    <div>
+      <h3 className="text-xl font-bold text-primary-900 mb-4">Promote Students to Next Grade</h3>
+      <p className="text-sm font-light text-primary-600 mb-4">
+        Run this once, at the end of the school year, to move every student out of this year's
+        classroom and into next year's in one step. Create next year's classrooms first under
+        Admin &rarr; Classrooms if they don't exist yet &mdash; then come back here and point each
+        current classroom at where its students should land.
+      </p>
+
+      {sortedClassrooms.length === 0 ? (
+        <p className="text-sm font-light text-primary-500">No classrooms yet.</p>
+      ) : (
+        <div className="grid gap-3 mb-6">
+          {sortedClassrooms.map(c => {
+            const count = data.students.filter(s => s.classroomId === c.id).length;
+            const val = targets[c.id] || 'keep';
+            return (
+              <div key={c.id} className="bg-white rounded-2xl card-shadow border border-primary-100 p-4 flex items-center justify-between flex-wrap gap-3">
+                <div>
+                  <p className="font-bold text-primary-900">{classroomLabel(c)}</p>
+                  <p className="text-xs font-light text-primary-500">{count} students</p>
+                </div>
+                <select value={val} onChange={e => setTarget(c.id, e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2 text-sm">
+                  <option value="keep">Keep as-is (no change)</option>
+                  {data.classrooms.filter(cc => cc.id !== c.id).map(cc => (
+                    <option key={cc.id} value={cc.id}>Move to: {classroomLabel(cc)}</option>
+                  ))}
+                  <option value="graduate">Remove from roster (graduating)</option>
+                </select>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <PrimaryButton disabled={busy || plan.length === 0} onClick={applyPromotion}>
+        {busy ? 'Applying…' : 'Apply Promotion (' + plan.length + ' classroom(s))'}
+      </PrimaryButton>
+
+      {result && (
+        <div className="mt-4 bg-green-50 border border-green-300 rounded-xl p-4 text-sm text-green-800">
+          {result.map((line, i) => <p key={i}>{line}</p>)}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ============================ ADMIN PANEL ============================ */
 function AdminPanel({ data, authUser, onLogout }) {
   const [tab, setTab] = useState('analytics');
@@ -1949,7 +2412,9 @@ function AdminPanel({ data, authUser, onLogout }) {
     ['students', 'Students'],
     ['gradebands', 'Grade Bands'],
     ['settings', 'Term Settings'],
-    ['export', 'Export']
+    ['export', 'Export'],
+    ['datamgmt', 'Data Management'],
+    ['promote', 'Promote Students']
   ];
   return (
     <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
@@ -1977,6 +2442,8 @@ function AdminPanel({ data, authUser, onLogout }) {
       {tab === 'gradebands' && <GradeBandsPanel data={data} />}
       {tab === 'settings' && <TermSettingsPanel settings={data.settings} />}
       {tab === 'export' && <ExportPanel data={data} />}
+      {tab === 'datamgmt' && <DataManagementTab data={data} />}
+      {tab === 'promote' && <PromoteStudentsPanel data={data} />}
     </div>
   );
 }
