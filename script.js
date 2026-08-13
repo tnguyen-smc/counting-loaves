@@ -673,7 +673,7 @@ function NavBar({ role, onRequestRole }) {
       <div className="max-w-6xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between flex-wrap gap-3">
         <div className="flex items-center gap-3">
           <img
-            src="logo-school.png"
+            src="Logo-school.png"
             alt="St. Mary Catholic School Logo"
             className="h-10 w-auto"
           />
