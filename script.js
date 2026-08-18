@@ -52,7 +52,7 @@ if (!FIREBASE_NOT_CONFIGURED) {
 }
 
 /* ============================ CONSTANTS ============================ */
-const DAILY_PASSWORD = 'countingloaves';
+const DAILY_PASSWORD = 'stmaryloaves';
 const DEVICE_AUTH_STORAGE_KEY = 'countingloaves_device_auth_date';
 const TERM_KEYS = ['S1','S2','Q1','Q2','Q3','Q4'];
 const TERM_LABELS = { Q1: 'Quarter 1', Q2: 'Quarter 2', Q3: 'Quarter 3', Q4: 'Quarter 4', S1: 'Semester 1', S2: 'Semester 2' };
