@@ -878,8 +878,8 @@ function DailyPasswordGate({ children }) {
     <div className="fixed inset-0 bg-primary-900 flex items-center justify-center z-[100] p-4">
       <div className="bg-white rounded-2xl card-shadow-lg p-8 w-full max-w-sm text-center">
         <div className="text-4xl mb-3">🍞</div>
-        <h2 className="text-xl font-bold text-primary-900 mb-1">Counting Loaves</h2>
-        <p className="text-sm font-light text-primary-600 mb-6">Enter today's access password to continue. This is only needed once per device, per day.</p>
+        <h2 className="text-xl font-bold text-primary-900 mb-1">Counting Loaves - St. Mary</h2>
+        <p className="text-sm font-light text-primary-600 mb-6">Enter the access password to continue.</p>
         <form onSubmit={submit}>
           <input
             autoFocus
@@ -1101,7 +1101,7 @@ function TeacherOverview({ data, onOpenClassroom, onOpenBreakfastFinal }) {
         className={"text-left bg-white rounded-2xl card-shadow p-6 border transition-fast btn-touch w-full sm:w-auto sm:min-w-[340px] " + (noSchool ? 'opacity-50 cursor-not-allowed border-primary-100' : 'hover:card-shadow-lg border-primary-100 hover:border-primary-300')}
       >
         <div className="flex justify-between items-start mb-2">
-          <h3 className="text-xl font-bold text-primary-900">🥣 Breakfast Verification</h3>
+          <h3 className="text-xl font-bold text-primary-900">Breakfast Verification</h3>
           <Badge status={breakfastStatus} />
         </div>
         <p className="text-sm font-light text-primary-600 mb-1">
@@ -1298,7 +1298,7 @@ function BreakfastFinalView({ data, onBack }) {
           the per-classroom Breakfast Pre-Count is for) — the two are easy to confuse otherwise. */}
       <div className="mb-6 bg-primary text-white rounded-2xl p-5 text-center card-shadow">
         <p className="text-xs font-bold uppercase tracking-widest text-primary-100 mb-1">Breakfast Verification</p>
-        <p className="text-xl font-bold">🥣 You are taking breakfast for TODAY — {formatDisplayDate(today)}</p>
+        <p className="text-xl font-bold">🍳 You are taking breakfast for TODAY — {formatDisplayDate(today)}</p>
       </div>
 
       {noSchool && <NoSchoolBanner label={holiday && holiday.label} />}
