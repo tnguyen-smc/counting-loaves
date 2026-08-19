@@ -100,15 +100,27 @@ function sortStudents(list, sortBy) {
   return arr;
 }
 function defaultEntry() { return { absent: false, meal: 'hot', milk: 'yes' }; }
+// Breakfast defaults to "No Breakfast" (meal: 'sack', milk: 'no') since fewer students take
+// breakfast than lunch — teachers only need to flip the students who ARE eating breakfast,
+// rather than flipping everyone who isn't.
+function defaultBreakfastEntry() { return { absent: false, meal: 'sack', milk: 'no' }; }
 function emptyEntries(roster) {
   const e = {};
   roster.forEach(s => { e[s.id] = defaultEntry(); });
   return e;
 }
-function tallyEntries(entries, roster) {
+function emptyBreakfastEntries(roster) {
+  const e = {};
+  roster.forEach(s => { e[s.id] = defaultBreakfastEntry(); });
+  return e;
+}
+// defaultEntryFn lets callers supply a different fallback (e.g. defaultBreakfastEntry) for
+// students missing from the entries map, without duplicating the tally logic.
+function tallyEntries(entries, roster, defaultEntryFn) {
+  const fallback = defaultEntryFn || defaultEntry;
   let hot = 0, sack = 0, absent = 0, milk = 0;
   roster.forEach(s => {
-    const e = (entries && entries[s.id]) || defaultEntry();
+    const e = (entries && entries[s.id]) || fallback();
     if (e.absent) { absent++; return; }
     if (e.meal === 'hot') hot++; else if (e.meal === 'sack') sack++;
     if (e.milk === 'yes') milk++;
@@ -621,7 +633,7 @@ function buildMonthlyBreakfastCountDays(data, year, month) {
     const band = bandForGrade(data.settings, cls.grade);
     const roster = data.students.filter(s => s.classroomId === cls.id);
     roster.forEach(s => {
-      const e = (log.breakfast.entries && log.breakfast.entries[s.id]) || defaultEntry();
+      const e = (log.breakfast.entries && log.breakfast.entries[s.id]) || defaultBreakfastEntry();
       if (e.absent) return;
       if (e.meal !== 'hot') return; // meal === 'hot' represents "ate breakfast"
       const status = s.lunchStatus || 'paid';
@@ -1010,8 +1022,8 @@ function TeacherOverview({ data, onOpenClassroom }) {
 // ({ absent, meal, milk }), and interaction model — only the meal-option labels differ, since a
 // breakfast count is "Breakfast" / "No Breakfast" instead of "Hot Lunch" / "Sack Lunch".
 function StudentEntryCard({ student, entry, onChange, disabled, kind }) {
-  const e = entry || defaultEntry();
   const isBreakfast = kind === 'breakfast';
+  const e = entry || (isBreakfast ? defaultBreakfastEntry() : defaultEntry());
   function set(patch) { if (!disabled) onChange({ ...e, ...patch }); }
   function setMeal(meal) { set({ meal, milk: meal === 'hot' ? 'yes' : 'no' }); }
 
@@ -1116,16 +1128,17 @@ function ReviewStudentCard({ student, entry, onChange, kind }) {
 }
 
 function ReviewScreen({ stage, cls, roster, entries, onChangeEntry, onEdit, onSubmit, targetDateLabel }) {
-  const totals = tallyEntries(entries, roster);
+  const isBreakfast = stage === 'breakfast';
+  const defaultFn = isBreakfast ? defaultBreakfastEntry : defaultEntry;
+  const totals = tallyEntries(entries, roster, defaultFn);
   const hotStudents = [], sackStudents = [], absentStudents = [];
   roster.forEach(s => {
-    const e = entries[s.id] || defaultEntry();
+    const e = entries[s.id] || defaultFn();
     if (e.absent) absentStudents.push(s);
     else if (e.meal === 'hot') hotStudents.push(s);
     else sackStudents.push(s);
   });
 
-  const isBreakfast = stage === 'breakfast';
   const titles = { pre: 'Review Lunch Pre-Count', breakfast: 'Review Breakfast Count', final: 'Review Lunch Final Count' };
   const submitLabels = { pre: 'Submit Lunch Pre-Count', breakfast: 'Submit Breakfast Count', final: 'Submit Lunch Final Count' };
   const title = titles[stage];
@@ -1172,7 +1185,7 @@ function ReviewScreen({ stage, cls, roster, entries, onChangeEntry, onEdit, onSu
                 <ReviewStudentCard
                   key={s.id}
                   student={s}
-                  entry={entries[s.id] || defaultEntry()}
+                  entry={entries[s.id] || defaultFn()}
                   onChange={(entry) => onChangeEntry(s.id, entry)}
                   kind={isBreakfast ? 'breakfast' : 'lunch'}
                 />
@@ -1295,7 +1308,7 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
     if (!todayLog) {
       saveLogFull(today, classroomId, {
         pre: { entries: emptyEntries(roster), submitted: false, submittedAt: null },
-        breakfast: { entries: emptyEntries(roster), submitted: false, submittedAt: null, targetDate: breakfastTargetDate },
+        breakfast: { entries: emptyBreakfastEntries(roster), submitted: false, submittedAt: null, targetDate: breakfastTargetDate },
         final: { entries: emptyEntries(roster), submitted: false, submittedAt: null },
         verified: false,
         verifiedAt: null
@@ -1309,7 +1322,7 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
   const locked = verified || noSchool;
 
   const preEntries = (todayLog && todayLog.pre && todayLog.pre.entries) || emptyEntries(roster);
-  const breakfastEntries = (todayLog && todayLog.breakfast && todayLog.breakfast.entries) || emptyEntries(roster);
+  const breakfastEntries = (todayLog && todayLog.breakfast && todayLog.breakfast.entries) || emptyBreakfastEntries(roster);
   const hasOwnFinalEntries = todayLog && todayLog.final && todayLog.final.entries && Object.keys(todayLog.final.entries).length > 0;
   const finalEntries = hasOwnFinalEntries ? todayLog.final.entries : preEntries;
 
@@ -1320,7 +1333,7 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
   function emptyBase() {
     return {
       pre: { entries: emptyEntries(roster), submitted: false, submittedAt: null },
-      breakfast: { entries: emptyEntries(roster), submitted: false, submittedAt: null, targetDate: breakfastTargetDate },
+      breakfast: { entries: emptyBreakfastEntries(roster), submitted: false, submittedAt: null, targetDate: breakfastTargetDate },
       final: { entries: emptyEntries(roster), submitted: false, submittedAt: null },
       verified: false,
       verifiedAt: null
@@ -1369,7 +1382,7 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
 
   const submitFns = { pre: submitPre, breakfast: submitBreakfast, final: submitFinal };
   const activeEntries = stage === 'pre' ? preEntries : stage === 'breakfast' ? breakfastEntries : finalEntries;
-  const totals = tallyEntries(activeEntries, roster);
+  const totals = tallyEntries(activeEntries, roster, stage === 'breakfast' ? defaultBreakfastEntry : defaultEntry);
   const sortedRoster = sortStudents(roster, sortBy);
   const stageLabels = { pre: 'Lunch Pre-Count', breakfast: 'Breakfast Count', final: 'Lunch Final Count' };
 
@@ -1495,7 +1508,7 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
               <StudentEntryCard
                 key={s.id}
                 student={s}
-                entry={activeEntries[s.id] || defaultEntry()}
+                entry={activeEntries[s.id] || (stage === 'breakfast' ? defaultBreakfastEntry() : defaultEntry())}
                 onChange={(entry) => updateEntry(stage, s.id, entry)}
                 disabled={locked}
                 kind={stage === 'breakfast' ? 'breakfast' : 'lunch'}
@@ -2753,8 +2766,8 @@ function StudentRecordEditor({ data }) {
   }
 
   function EntryEditor({ label, entry, stageKey, kind }) {
-    const e = entry || defaultEntry();
     const isBreakfast = kind === 'breakfast';
+    const e = entry || (isBreakfast ? defaultBreakfastEntry() : defaultEntry());
     return (
       <div className="bg-primary-50 rounded-xl p-4">
         <p className="text-xs font-semibold text-primary-700 uppercase mb-2">{label}{!entry && ' (no entry saved)'}</p>
