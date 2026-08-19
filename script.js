@@ -1350,7 +1350,13 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
       saveLogFull(today, classroomId, {
         pre: { entries: emptyEntries(roster), submitted: false, submittedAt: null },
         breakfast: { entries: emptyBreakfastEntries(roster), submitted: false, submittedAt: null, targetDate: breakfastTargetDate },
-        final: { entries: emptyEntries(roster), submitted: false, submittedAt: null },
+        // NOTE: final.entries starts as a truly empty {} — NOT emptyEntries(roster). If it were
+        // pre-filled with generic default entries here, `hasOwnFinalEntries` below would see a
+        // non-empty map immediately and treat that as "the teacher's own final count", so the
+        // Lunch Final Count screen would show generic Hot-Lunch-for-everyone defaults instead of
+        // mirroring the morning Pre-Count. Leaving this {} lets `finalEntries` fall through to
+        // `preEntries` (and stay in sync with it) until the teacher actually touches Final.
+        final: { entries: {}, submitted: false, submittedAt: null },
         verified: false,
         verifiedAt: null
       });
@@ -1364,6 +1370,10 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
 
   const preEntries = (todayLog && todayLog.pre && todayLog.pre.entries) || emptyEntries(roster);
   const breakfastEntries = (todayLog && todayLog.breakfast && todayLog.breakfast.entries) || emptyBreakfastEntries(roster);
+  // True only once the teacher has actually put their own data into Final (by editing a card
+  // while on the Final stage, or by submitting Final at least once). Until then this stays
+  // false, so `finalEntries` below live-mirrors whatever is in the Pre-Count — including any
+  // pre-count edits made after the daily log was first created.
   const hasOwnFinalEntries = todayLog && todayLog.final && todayLog.final.entries && Object.keys(todayLog.final.entries).length > 0;
   const finalEntries = hasOwnFinalEntries ? todayLog.final.entries : preEntries;
 
@@ -1375,7 +1385,9 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
     return {
       pre: { entries: emptyEntries(roster), submitted: false, submittedAt: null },
       breakfast: { entries: emptyBreakfastEntries(roster), submitted: false, submittedAt: null, targetDate: breakfastTargetDate },
-      final: { entries: emptyEntries(roster), submitted: false, submittedAt: null },
+      // Same reasoning as the useEffect above: keep this {} so a fresh/never-touched Final Count
+      // mirrors the Pre-Count instead of generic defaults.
+      final: { entries: {}, submitted: false, submittedAt: null },
       verified: false,
       verifiedAt: null
     };
