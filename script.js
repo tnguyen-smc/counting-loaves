@@ -731,13 +731,13 @@ function StatCard({ label, value }) {
   );
 }
 
-function FloatingSummary({ totals }) {
+function FloatingSummary({ totals, hideMilk }) {
   return (
     <div className="hidden lg:flex flex-col gap-2 fixed left-4 top-28 z-30 bg-white rounded-2xl card-shadow-lg border border-primary-100 p-4 w-36">
       <p className="font-bold text-primary-900 text-sm leading-tight">Hot: {totals.hot}</p>
       <p className="font-bold text-primary-900 text-sm leading-tight">Sack: {totals.sack}</p>
       <p className="font-bold text-primary-900 text-sm leading-tight">Absent: {totals.absent}</p>
-      <p className="font-bold text-primary-900 text-sm leading-tight">Milk: {totals.milk}</p>
+      {!hideMilk && <p className="font-bold text-primary-900 text-sm leading-tight">Milk: {totals.milk}</p>}
     </div>
   );
 }
@@ -782,24 +782,25 @@ function DangerButton({ children, onClick, disabled, className }) {
   );
 }
 
-function SuccessModal({ title, message, onDone }) {
-  useEffect(() => {
-    const t = setTimeout(onDone, 2800);
-    return () => clearTimeout(t);
-    // eslint-disable-next-line
-  }, []);
+// Manual-dismiss only: the teacher must tap a button to leave this modal, it never auto-closes.
+// Pass `children` to replace the default single "Back to Home" button with custom navigation
+// options (see the post-Lunch-Pre-Count flow in ClassroomWorkspace) while keeping the same
+// classic green success styling.
+function SuccessModal({ title, message, onDone, children }) {
   return (
     <div className="fixed inset-0 bg-primary-900/50 flex items-center justify-center z-50 p-4">
       <div className="bg-white rounded-2xl card-shadow-lg p-8 w-full max-w-sm text-center border-4 border-green-500">
         <div className="w-16 h-16 rounded-full bg-green-100 text-green-600 flex items-center justify-center text-3xl mx-auto mb-4">✓</div>
         <h2 className="text-xl font-bold text-green-700 mb-2">{title}</h2>
         <p className="text-sm font-light text-primary-600 mb-6">{message}</p>
-        <button
-          onClick={onDone}
-          className="btn-touch w-full px-5 py-3 rounded-xl bg-green-600 text-white font-semibold text-base transition-fast hover:bg-green-700 active:scale-[0.98]"
-        >
-          Back to Home
-        </button>
+        {children ? children : (
+          <button
+            onClick={onDone}
+            className="btn-touch w-full px-5 py-3 rounded-xl bg-green-600 text-white font-semibold text-base transition-fast hover:bg-green-700 active:scale-[0.98]"
+          >
+            Back to Home
+          </button>
+        )}
       </div>
     </div>
   );
@@ -1018,29 +1019,64 @@ function TeacherOverview({ data, onOpenClassroom }) {
 }
 
 /* ============================ STUDENT ENTRY CARD ============================ */
-// kind: 'lunch' (default) or 'breakfast'. Both share the exact same card layout, entry shape
-// ({ absent, meal, milk }), and interaction model — only the meal-option labels differ, since a
-// breakfast count is "Breakfast" / "No Breakfast" instead of "Hot Lunch" / "Sack Lunch".
+// kind: 'lunch' (default), 'breakfast', or 'final'. All three share the same entry shape
+// ({ absent, meal, milk }) and interaction model — only the meal-option labels, the presence of
+// the Milk Choice section, and the card's color coding differ:
+//  - 'breakfast': labeled "Breakfast" / "No Breakfast" and has NO milk choice at all (breakfast
+//     only tracks status, never milk).
+//  - 'final': the Lunch Final Count card. Color-coded so a teacher scrolling a long single-column
+//     list can tell status at a glance — warm orange for Hot Lunch, blueish for Sack Lunch, and
+//     greyed-out for Absent with a distinct red "Undo Absent" box in the card's top-right corner.
+//  - 'lunch' (default, used for the Lunch Pre-Count): the original neutral white/grey styling.
 function StudentEntryCard({ student, entry, onChange, disabled, kind }) {
   const isBreakfast = kind === 'breakfast';
+  const isFinal = kind === 'final';
   const e = entry || (isBreakfast ? defaultBreakfastEntry() : defaultEntry());
   function set(patch) { if (!disabled) onChange({ ...e, ...patch }); }
   function setMeal(meal) { set({ meal, milk: meal === 'hot' ? 'yes' : 'no' }); }
 
+  const cardColor = e.absent
+    ? 'bg-gray-100 border-gray-300'
+    : isFinal
+      ? (e.meal === 'hot' ? 'bg-orange-50 border-orange-300' : 'bg-blue-50 border-blue-300')
+      : 'bg-white border-primary-100';
+
   return (
-    <div className={"rounded-2xl card-shadow p-4 border flex flex-col gap-3 transition-fast " + (e.absent ? 'bg-gray-100 border-gray-300' : 'bg-white border-primary-100')}>
+    <div className={"relative rounded-2xl card-shadow p-4 border flex flex-col gap-3 transition-fast " + cardColor}>
       <div className="flex items-start justify-between gap-2">
         <p className={"font-semibold text-primary-900 truncate " + (e.absent ? 'opacity-60' : '')}>
           <span className="text-primary-400 font-medium">#{student.number}</span> {student.firstName} {student.lastName}
         </p>
-        <button
-          type="button"
-          disabled={disabled}
-          onClick={() => set({ absent: !e.absent })}
-          className={"shrink-0 text-xs font-bold px-2.5 py-1.5 rounded-full transition-fast cursor-pointer " + (e.absent ? 'bg-rose-600 text-white' : 'bg-rose-50 text-rose-600 hover:bg-rose-100')}
-        >
-          {e.absent ? 'Undo Absent' : 'Mark Absent'}
-        </button>
+        {isFinal ? (
+          e.absent ? (
+            <button
+              type="button"
+              disabled={disabled}
+              onClick={() => set({ absent: false })}
+              className="shrink-0 text-xs font-bold px-2.5 py-1.5 rounded-lg bg-white border-2 border-red-300 text-red-600 hover:bg-red-50 transition-fast cursor-pointer"
+            >
+              Undo Absent
+            </button>
+          ) : (
+            <button
+              type="button"
+              disabled={disabled}
+              onClick={() => set({ absent: true })}
+              className="shrink-0 text-xs font-bold px-2.5 py-1.5 rounded-full bg-rose-50 text-rose-600 hover:bg-rose-100 transition-fast cursor-pointer"
+            >
+              Mark Absent
+            </button>
+          )
+        ) : (
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => set({ absent: !e.absent })}
+            className={"shrink-0 text-xs font-bold px-2.5 py-1.5 rounded-full transition-fast cursor-pointer " + (e.absent ? 'bg-rose-600 text-white' : 'bg-rose-50 text-rose-600 hover:bg-rose-100')}
+          >
+            {e.absent ? 'Undo Absent' : 'Mark Absent'}
+          </button>
+        )}
       </div>
 
       <div className={e.absent ? 'opacity-40 pointer-events-none select-none' : ''}>
@@ -1050,7 +1086,7 @@ function StudentEntryCard({ student, entry, onChange, disabled, kind }) {
             type="button"
             disabled={disabled}
             onClick={() => setMeal('hot')}
-            className={"flex-1 btn-touch rounded-xl font-semibold text-sm transition-fast border-2 " + (e.meal === 'hot' ? 'bg-primary text-white border-primary' : 'bg-gray-50 text-gray-400 border-gray-200 hover:bg-gray-100')}
+            className={"flex-1 btn-touch rounded-xl font-semibold text-sm transition-fast border-2 " + (e.meal === 'hot' ? (isFinal ? 'bg-orange-500 text-white border-orange-500' : 'bg-primary text-white border-primary') : 'bg-gray-50 text-gray-400 border-gray-200 hover:bg-gray-100')}
           >
             {isBreakfast ? 'Breakfast' : 'Hot Lunch'}
           </button>
@@ -1058,25 +1094,29 @@ function StudentEntryCard({ student, entry, onChange, disabled, kind }) {
             type="button"
             disabled={disabled}
             onClick={() => setMeal('sack')}
-            className={"flex-1 btn-touch rounded-xl font-semibold text-sm transition-fast border-2 " + (e.meal === 'sack' ? 'bg-gray-200 text-blue-700 border-gray-300' : 'bg-gray-50 text-gray-400 border-gray-200 hover:bg-gray-100')}
+            className={"flex-1 btn-touch rounded-xl font-semibold text-sm transition-fast border-2 " + (e.meal === 'sack' ? (isFinal ? 'bg-blue-500 text-white border-blue-500' : 'bg-gray-200 text-blue-700 border-gray-300') : 'bg-gray-50 text-gray-400 border-gray-200 hover:bg-gray-100')}
           >
             {isBreakfast ? 'No Breakfast' : 'Sack Lunch'}
           </button>
         </div>
-        <p className="text-xs font-medium text-primary-500 mb-1 uppercase tracking-wide">Milk Choice</p>
-        <div className="flex gap-2">
-          {[['yes','Yes'],['no','No']].map(([val,label]) => (
-            <button
-              type="button"
-              key={val}
-              disabled={disabled}
-              onClick={() => set({ milk: val })}
-              className={"flex-1 btn-touch rounded-xl font-semibold text-xs transition-fast border-2 " + (e.milk === val ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
+        {!isBreakfast && (
+          <React.Fragment>
+            <p className="text-xs font-medium text-primary-500 mb-1 uppercase tracking-wide">Milk Choice</p>
+            <div className="flex gap-2">
+              {[['yes','Yes'],['no','No']].map(([val,label]) => (
+                <button
+                  type="button"
+                  key={val}
+                  disabled={disabled}
+                  onClick={() => set({ milk: val })}
+                  className={"flex-1 btn-touch rounded-xl font-semibold text-xs transition-fast border-2 " + (e.milk === val ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </React.Fragment>
+        )}
       </div>
     </div>
   );
@@ -1105,11 +1145,12 @@ function ReviewStatusControl({ entry, onChange, kind }) {
 }
 
 function ReviewStudentCard({ student, entry, onChange, kind }) {
+  const isBreakfast = kind === 'breakfast';
   return (
     <div className="bg-white rounded-xl card-shadow border border-primary-100 p-3 flex items-center gap-3">
       <div className="flex-1 min-w-0">
         <p className="font-medium text-primary-900 truncate text-sm"><span className="text-primary-400">#{student.number}</span> {student.firstName} {student.lastName}</p>
-        {!entry.absent && (
+        {!entry.absent && !isBreakfast && (
           <div className="flex gap-1 mt-1">
             {[['yes','Milk: Yes'],['no','Milk: No']].map(([val,label]) => (
               <button
@@ -1158,18 +1199,18 @@ function ReviewScreen({ stage, cls, roster, entries, onChangeEntry, onEdit, onSu
 
   return (
     <div>
-      <FloatingSummary totals={totals} />
+      <FloatingSummary totals={totals} hideMilk={isBreakfast} />
       <button onClick={onEdit} className="text-primary font-semibold text-sm mb-4 hover:underline">&larr; Edit / Go Back</button>
       <h2 className="text-2xl font-bold text-primary-900 mb-1">{title}</h2>
       <p className="text-primary-600 font-light mb-6">
         {cls.grade} &middot; {cls.teacher} &middot; {isBreakfast ? ('For ' + targetDateLabel) : formatDisplayDate(todayStr())}
       </p>
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+      <div className={"grid grid-cols-2 gap-3 mb-6 " + (isBreakfast ? 'sm:grid-cols-3' : 'sm:grid-cols-4')}>
         <StatCard label={isBreakfast ? 'Breakfast' : 'Hot Lunch'} value={totals.hot} />
         <StatCard label={isBreakfast ? 'No Breakfast' : 'Sack Lunch'} value={totals.sack} />
         <StatCard label="Absent" value={totals.absent} />
-        <StatCard label="Milk" value={totals.milk} />
+        {!isBreakfast && <StatCard label="Milk" value={totals.milk} />}
       </div>
 
       <div className="grid md:grid-cols-3 gap-4 mb-6">
@@ -1198,7 +1239,7 @@ function ReviewScreen({ stage, cls, roster, entries, onChangeEntry, onEdit, onSu
       <div className="sticky bottom-0 bg-secondary/95 backdrop-blur pt-4 pb-2 border-t border-primary-100">
         <div className="flex justify-between items-center flex-wrap gap-3">
           <p className="text-sm text-primary-600 font-light lg:hidden">
-            Hot {totals.hot} &middot; Sack {totals.sack} &middot; Absent {totals.absent} &middot; Milk {totals.milk}
+            {isBreakfast ? 'Breakfast' : 'Hot'} {totals.hot} &middot; {isBreakfast ? 'No Breakfast' : 'Sack'} {totals.sack} &middot; Absent {totals.absent}{!isBreakfast ? (' \u00b7 Milk ' + totals.milk) : ''}
           </p>
           <div className="flex gap-3 ml-auto">
             <GhostButton onClick={onEdit}>Edit / Go Back</GhostButton>
@@ -1380,6 +1421,14 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
     onBack();
   }
 
+  // After the Lunch Pre-Count is submitted, keep the teacher in this workspace and drop them
+  // straight into the Breakfast Count instead of sending them back Home.
+  function goToBreakfastFromSuccess() {
+    setSuccessInfo(null);
+    setReviewing(false);
+    setStage('breakfast');
+  }
+
   const submitFns = { pre: submitPre, breakfast: submitBreakfast, final: submitFinal };
   const activeEntries = stage === 'pre' ? preEntries : stage === 'breakfast' ? breakfastEntries : finalEntries;
   const totals = tallyEntries(activeEntries, roster, stage === 'breakfast' ? defaultBreakfastEntry : defaultEntry);
@@ -1388,7 +1437,7 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
 
   return (
     <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8 lg:pl-40">
-      {!reviewing && roster.length > 0 && <FloatingSummary totals={totals} />}
+      {!reviewing && roster.length > 0 && <FloatingSummary totals={totals} hideMilk={stage === 'breakfast'} />}
 
       {showEntryModal && roster.length > 0 && (
         <ClassroomEntryModal
@@ -1503,7 +1552,7 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
             </select>
           </div>
 
-          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">
+          <div className={stage === 'final' ? 'flex flex-col gap-4 mb-8 max-w-2xl' : 'grid sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-8'}>
             {sortedRoster.map(s => (
               <StudentEntryCard
                 key={s.id}
@@ -1511,7 +1560,7 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
                 entry={activeEntries[s.id] || (stage === 'breakfast' ? defaultBreakfastEntry() : defaultEntry())}
                 onChange={(entry) => updateEntry(stage, s.id, entry)}
                 disabled={locked}
-                kind={stage === 'breakfast' ? 'breakfast' : 'lunch'}
+                kind={stage === 'breakfast' ? 'breakfast' : stage === 'final' ? 'final' : 'lunch'}
               />
             ))}
           </div>
@@ -1519,7 +1568,7 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
           <div className="sticky bottom-0 bg-secondary/95 backdrop-blur pt-4 pb-2 border-t border-primary-100">
             <div className="flex justify-between items-center flex-wrap gap-3">
               <p className="text-sm text-primary-600 font-light lg:hidden">
-                {totals.hot} &middot; {totals.sack} &middot; Absent {totals.absent} &middot; Milk {totals.milk}
+                {totals.hot} &middot; {totals.sack} &middot; Absent {totals.absent}{stage !== 'breakfast' ? (' \u00b7 Milk ' + totals.milk) : ''}
               </p>
               <div className="flex gap-3 ml-auto">
                 <GhostButton onClick={onBack}>Cancel</GhostButton>
@@ -1532,11 +1581,32 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
         </React.Fragment>
       )}
 
-      {successInfo && (
+      {successInfo && successInfo.stage === 'pre' && (
         <SuccessModal
-          title={successInfo.stage === 'pre' ? 'Pre-Count Submitted!' : successInfo.stage === 'breakfast' ? 'Breakfast Count Submitted!' : 'Final Count Submitted!'}
+          title="Pre-Count Submitted!"
+          message={'The Lunch Pre-Count has been saved. Next, take the Breakfast Count for ' + formatShortDate(breakfastTargetDate) + '.'}
+        >
+          <div className="flex flex-col gap-3">
+            <button
+              onClick={goToBreakfastFromSuccess}
+              className="btn-touch w-full px-5 py-3 rounded-xl bg-green-600 text-white font-semibold text-base transition-fast hover:bg-green-700 active:scale-[0.98]"
+            >
+              Take Breakfast Count Next &rarr;
+            </button>
+            <button
+              onClick={handleDone}
+              className="btn-touch w-full px-4 py-2.5 rounded-xl bg-gray-100 text-gray-400 font-medium text-sm border border-gray-200 hover:bg-gray-200 hover:text-gray-500 transition-fast"
+            >
+              Return Home
+            </button>
+          </div>
+        </SuccessModal>
+      )}
+
+      {successInfo && successInfo.stage !== 'pre' && (
+        <SuccessModal
+          title={successInfo.stage === 'breakfast' ? 'Breakfast Count Submitted!' : 'Final Count Submitted!'}
           message={
-            successInfo.stage === 'pre' ? 'The Lunch Pre-Count has been saved. Next, take the Breakfast Count for ' + formatShortDate(breakfastTargetDate) + '.' :
             successInfo.stage === 'breakfast' ? 'The Breakfast Count has been saved for ' + formatShortDate(breakfastTargetDate) + '. Next, complete the Lunch Final Count.' :
             'The Lunch Final Count has been saved for today.'
           }
@@ -2779,9 +2849,11 @@ function StudentRecordEditor({ data }) {
             <React.Fragment>
               <button onClick={() => saveEntry(stageKey, { ...e, meal: 'hot', milk: e.milk === 'no' ? 'no' : 'yes' })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (e.meal === 'hot' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>{isBreakfast ? 'Breakfast' : 'Hot Lunch'}</button>
               <button onClick={() => saveEntry(stageKey, { ...e, meal: 'sack' })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (e.meal === 'sack' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>{isBreakfast ? 'No Breakfast' : 'Sack Lunch'}</button>
-              <button onClick={() => saveEntry(stageKey, { ...e, milk: e.milk === 'yes' ? 'no' : 'yes' })} className="px-3 py-1.5 rounded-lg text-xs font-semibold border-2 bg-white text-primary-700 border-primary-200">
-                Milk: {e.milk === 'yes' ? 'Yes' : 'No'} (tap to toggle)
-              </button>
+              {!isBreakfast && (
+                <button onClick={() => saveEntry(stageKey, { ...e, milk: e.milk === 'yes' ? 'no' : 'yes' })} className="px-3 py-1.5 rounded-lg text-xs font-semibold border-2 bg-white text-primary-700 border-primary-200">
+                  Milk: {e.milk === 'yes' ? 'Yes' : 'No'} (tap to toggle)
+                </button>
+              )}
             </React.Fragment>
           )}
           {entry && <button onClick={() => clearEntry(stageKey)} className="px-3 py-1.5 rounded-lg text-xs font-semibold border-2 bg-white text-rose-600 border-rose-200">Remove Entry</button>}
