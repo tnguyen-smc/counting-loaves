@@ -2768,15 +2768,15 @@ function StudentManagement({ data }) {
         <form onSubmit={addStudent} className="bg-white rounded-2xl card-shadow p-4 border border-primary-100 mb-4 flex flex-wrap gap-3 items-end">
           <div className="w-24">
             <label className="text-xs font-medium text-primary-500 uppercase">Student #</label>
-            <input value={newNumber} onChange={e => setNewNumber(e.target.value)} placeholder="101" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary" />
+            <input value={newNumber} onChange={e => setNewNumber(e.target.value)} placeholder="#" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary" />
           </div>
           <div className="flex-1 min-w-[140px]">
             <label className="text-xs font-medium text-primary-500 uppercase">First Name</label>
-            <input value={newFirst} onChange={e => setNewFirst(e.target.value)} placeholder="Grace" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary" />
+            <input value={newFirst} onChange={e => setNewFirst(e.target.value)} placeholder="First" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary" />
           </div>
           <div className="flex-1 min-w-[140px]">
             <label className="text-xs font-medium text-primary-500 uppercase">Last Name</label>
-            <input value={newLast} onChange={e => setNewLast(e.target.value)} placeholder="Miller" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary" />
+            <input value={newLast} onChange={e => setNewLast(e.target.value)} placeholder="Last" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary" />
           </div>
           <div>
             <label className="text-xs font-medium text-primary-500 uppercase">Classroom</label>
