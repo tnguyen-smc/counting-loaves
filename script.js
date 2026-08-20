@@ -1,5 +1,126 @@
 const { useState, useEffect, useMemo, useRef } = React;
 
+/* ============================ iOS 12 COMPATIBILITY LAYER ============================ */
+// This app needs to render correctly on iOS 12 (Safari 12 / WebKit ~605), which is missing a
+// few things the rest of this file (and Tailwind's CDN build) otherwise assumes. Everything
+// below is either a no-op or an invisible fallback on modern browsers.
+//
+// 1. Flexbox `gap` isn't supported until Safari 14.1 / iOS 14.5 (Grid `gap` has been fine much
+//    longer, which is why `@supports (gap: 1px)` can't be used to detect this - it's true on
+//    iOS 12 too, just for the wrong reason). Every `flex ... gap-N` combo in this file (there
+//    are ~90) would render with zero spacing without a fallback.
+// 2. `position: sticky` needs the `-webkit-sticky` prefix on Safari 12 and below - confirmed by
+//    Tailwind's own tracker (tailwindlabs/tailwindcss#1385), where the bare utility silently
+//    failed on iOS 12.4.5 until the prefix was added.
+// 3. `backdrop-filter` needs `-webkit-backdrop-filter` on Safari.
+// 4. Tailwind's opacity-modifier utilities (e.g. `bg-primary-900/50`) compile to the modern CSS
+//    Color 4 syntax (`rgb(r g b / a)`). Safari 12's parser doesn't recognize the space/slash
+//    form and drops the whole declaration, so the intended translucent overlay is just
+//    invisible. Rather than hardcoding colors (which live in this project's Tailwind config,
+//    not this file), this reads the real color Tailwind resolved for the *solid* class (e.g.
+//    `bg-primary-900`) off an offscreen probe element, then re-declares the translucent variants
+//    with old-school `rgba()` - so it stays correct even if the theme colors change later.
+// 5. `Object.fromEntries` is ES2019 and only shipped in Safari 12.2 - devices stuck on iOS
+//    12.0/12.1 don't have it.
+if (typeof Object.fromEntries !== 'function') {
+  Object.fromEntries = function (entries) {
+    const obj = {};
+    for (const pair of entries) obj[pair[0]] = pair[1];
+    return obj;
+  };
+}
+
+(function ios12CompatFixes() {
+  function supportsFlexGap() {
+    try {
+      const flex = document.createElement('div');
+      flex.style.cssText = 'display:flex;flex-direction:column;row-gap:1px;position:absolute;visibility:hidden;';
+      flex.appendChild(document.createElement('div'));
+      flex.appendChild(document.createElement('div'));
+      document.body.appendChild(flex);
+      const supported = flex.scrollHeight === 1;
+      document.body.removeChild(flex);
+      return supported;
+    } catch (e) { return true; } // fail open - assume modern browser
+  }
+
+  // Classic "negative outer margin + positive margin on every child" gutter trick. Reproduces
+  // both row- and column-direction gaps, wrapped or not, without needing to know each
+  // container's flex-direction.
+  function buildGapFallbackCSS() {
+    const sizes = { '1': 0.25, '1\\.5': 0.375, '2': 0.5, '3': 0.75, '4': 1, '5': 1.25 }; // Tailwind default scale: gap-N = N * 0.25rem
+    let css = '';
+    Object.keys(sizes).forEach(function (key) {
+      const half = sizes[key] / 2;
+      css += 'html.no-flexbox-gap .flex.gap-' + key + '{margin:-' + half + 'rem !important;}\n';
+      css += 'html.no-flexbox-gap .flex.gap-' + key + '>*{margin:' + half + 'rem !important;}\n';
+    });
+    return css;
+  }
+
+  function injectCSS(css) {
+    const style = document.createElement('style');
+    style.setAttribute('data-ios12-compat', '');
+    style.textContent = css;
+    document.head.appendChild(style);
+  }
+
+  function buildOpacityFallbackCSS(done) {
+    const probeSpecs = [
+      { cls: 'bg-primary-900', variants: [['bg-primary-900\\/50', 0.5], ['bg-primary-900\\/40', 0.4]] },
+      { cls: 'bg-secondary',   variants: [['bg-secondary\\/95', 0.95]] },
+      { cls: 'bg-white',       variants: [['bg-white\\/60', 0.6], ['bg-white\\/40', 0.4]] }
+    ];
+    const probes = probeSpecs.map(function (spec) {
+      const el = document.createElement('div');
+      el.className = spec.cls;
+      el.style.cssText = 'position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;pointer-events:none;';
+      document.body.appendChild(el);
+      return { el: el, spec: spec };
+    });
+
+    // Tailwind's CDN/JIT compiler generates matching CSS asynchronously (it watches the DOM via
+    // MutationObserver), so poll briefly instead of assuming it's ready on the next frame.
+    let attempts = 0;
+    (function poll() {
+      attempts++;
+      const allResolved = probes.every(function (p) {
+        return /rgb/.test(getComputedStyle(p.el).backgroundColor);
+      });
+      if (allResolved || attempts > 20) {
+        let css = '';
+        probes.forEach(function (p) {
+          const rgb = getComputedStyle(p.el).backgroundColor; // serializes as "rgb(r, g, b)"
+          const m = rgb.match(/\d+/g);
+          if (m && m.length >= 3) {
+            const r = m[0], g = m[1], b = m[2];
+            p.spec.variants.forEach(function (v) {
+              css += '.' + v[0] + '{background-color:rgba(' + r + ',' + g + ',' + b + ',' + v[1] + ') !important;}\n';
+            });
+          }
+          p.el.parentNode.removeChild(p.el);
+        });
+        done(css);
+      } else {
+        setTimeout(poll, 100);
+      }
+    })();
+  }
+
+  function run() {
+    let css = '.sticky{position:-webkit-sticky !important;position:sticky !important;}\n'
+      + '.backdrop-blur{-webkit-backdrop-filter:blur(8px) !important;backdrop-filter:blur(8px) !important;}\n';
+    if (!supportsFlexGap()) {
+      document.documentElement.classList.add('no-flexbox-gap');
+      css += buildGapFallbackCSS();
+    }
+    injectCSS(css);
+    buildOpacityFallbackCSS(injectCSS);
+  }
+
+  if (document.body) run(); else document.addEventListener('DOMContentLoaded', run);
+})();
+
 /* ============================ FIREBASE CONFIGURATION ============================ */
 // TODO: replace with your Firebase project's web app config.
 // 1. Create a project at https://console.firebase.google.com
