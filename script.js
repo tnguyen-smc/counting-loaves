@@ -236,6 +236,12 @@ function sortStudents(list, sortBy) {
   const arr = (list || []).slice();
   if (sortBy === 'first') arr.sort((a,b) => a.firstName.localeCompare(b.firstName) || a.lastName.localeCompare(b.lastName));
   else if (sortBy === 'last') arr.sort((a,b) => a.lastName.localeCompare(b.lastName) || a.firstName.localeCompare(b.firstName));
+  else if (sortBy === 'position') arr.sort((a,b) => (a.position || '').localeCompare(b.position || '') || a.firstName.localeCompare(b.firstName));
+  else if (sortBy === 'order') arr.sort((a,b) => {
+    const ao = typeof a.sortOrder === 'number' ? a.sortOrder : 999999;
+    const bo = typeof b.sortOrder === 'number' ? b.sortOrder : 999999;
+    return ao - bo || a.firstName.localeCompare(b.firstName);
+  });
   else arr.sort((a,b) => studentNumberOf(a) - studentNumberOf(b));
   return arr;
 }
@@ -518,8 +524,13 @@ async function saveStudent(s) {
     firstName: s.firstName,
     lastName: s.lastName,
     classroomId: s.classroomId,
-    lunchStatus: s.lunchStatus || 'paid'
-  });
+    lunchStatus: s.lunchStatus || 'paid',
+    // position: free-text/dropdown job title, used for Staff & Adults roster only.
+    // sortOrder: manual drag-and-drop position for how a staff member's card appears in the
+    // classroom view; undefined for ordinary students (they use `number` instead).
+    position: s.position != null ? s.position : null,
+    sortOrder: typeof s.sortOrder === 'number' ? s.sortOrder : null
+  }, { merge: true });
   return id;
 }
 async function deleteStudentDoc(id) { await db.collection('students').doc(id).delete(); }
@@ -738,18 +749,24 @@ function computeTodayPreCountSnapshot(data) {
   });
   return { hot, sack, absent, milkHot, milkSack };
 }
+// IMPORTANT: this must tally the *same way* computeTodayPreCountSnapshot does (split milk by
+// meal type, same fallback-entry rules) so that once a classroom is verified, "Today's Verified
+// Count" reconciles exactly against what "Today's PreCount" showed live for that classroom
+// earlier in the day — no silent unit mismatch between the two cards (e.g. one combining milk
+// into a single number while the other splits it, which made the two totals impossible to
+// reconcile even when nothing about the underlying counts had actually changed).
 function computeTodayVerifiedSnapshot(data) {
   const today = todayStr();
-  let hot = 0, sack = 0, absent = 0, milk = 0;
+  let hot = 0, sack = 0, absent = 0, milkHot = 0, milkSack = 0;
   data.classrooms.forEach(cls => {
     if (cls.type === 'staff') return;
     const log = data.logsById[logId(today, cls.id)];
     if (!log || !log.verified) return;
     const roster = data.students.filter(s => s.classroomId === cls.id);
-    const t = tallyEntries((log.final && log.final.entries) || {}, roster);
-    hot += t.hot; sack += t.sack; absent += t.absent; milk += t.milk;
+    const t = tallyEntriesSplitMilk((log.final && log.final.entries) || {}, roster, defaultEntry);
+    hot += t.hot; sack += t.sack; absent += t.absent; milkHot += t.milkHot; milkSack += t.milkSack;
   });
-  return { hot, sack, absent, milk };
+  return { hot, sack, absent, milkHot, milkSack };
 }
 
 // Live snapshot of today's Staff & Adults lunch counts, for the admin "Today's PreCount" card.
@@ -766,6 +783,29 @@ function computeTodayStaffAdultSnapshot(data) {
     const t = tallyStaffEntries(entries, roster);
     staffLunch += t.yes;
     if (cls.showAdultCard) adultLunch += (log && log.pre && log.pre.adultsCount) || 0;
+  });
+  return { staffLunch, adultLunch };
+}
+
+// Verified counterpart to computeTodayStaffAdultSnapshot: only counts a Staff & Adults
+// classroom's Final Lunch Count once an admin has verified that classroom for today, reading
+// the same final entries / adultsCount fields the Verification tab locks in. Without this, the
+// Verified Count card had no staff/adult figures at all, even though the PreCount card does.
+function computeTodayVerifiedStaffAdultSnapshot(data) {
+  const today = todayStr();
+  let staffLunch = 0, adultLunch = 0;
+  data.classrooms.forEach(cls => {
+    if (cls.type !== 'staff') return;
+    const log = data.logsById[logId(today, cls.id)];
+    if (!log || !log.verified) return;
+    const roster = data.students.filter(s => s.classroomId === cls.id);
+    const entries = (log.final && log.final.entries) || {};
+    const t = tallyStaffEntries(entries, roster);
+    staffLunch += t.yes;
+    if (cls.showAdultCard) {
+      const preAdultsCount = (log.pre && log.pre.adultsCount) || 0;
+      adultLunch += (log.final && typeof log.final.adultsCount === 'number') ? log.final.adultsCount : preAdultsCount;
+    }
   });
   return { staffLunch, adultLunch };
 }
@@ -1028,7 +1068,7 @@ function CollapseToggle({ collapsed, onClick, label }) {
   return (
     <button
       type="button"
-      onClick={onClick}
+      onClick={(e) => { e.stopPropagation(); onClick(); }}
       title={collapsed ? 'Expand' : 'Collapse'}
       className="shrink-0 w-8 h-8 rounded-full bg-primary-50 text-primary-600 hover:bg-primary-100 flex items-center justify-center font-bold text-sm transition-fast"
       aria-label={label || (collapsed ? 'Expand' : 'Collapse')}
@@ -1036,6 +1076,15 @@ function CollapseToggle({ collapsed, onClick, label }) {
       {collapsed ? '▸' : '▾'}
     </button>
   );
+}
+
+// Shared collapse/expand state helpers used by every admin list (Classrooms, Staff & Adults,
+// Verification, Analytics). A section is treated as collapsed by default — only an explicit
+// `false` in the map (the user clicked to expand it) counts as expanded — so long lists open
+// fully collapsed instead of dumping every card open at once.
+function isSectionCollapsed(map, id) { return map[id] !== false; }
+function toggleSection(setMap, id) {
+  setMap(prev => ({ ...prev, [id]: isSectionCollapsed(prev, id) ? false : true }));
 }
 
 // isStaff switches this to the simplified Staff & Adults summary: just Staff count (how many
@@ -1357,6 +1406,10 @@ function TeacherOverview({ data, onOpenClassroom, onOpenBreakfastFinal }) {
           const classroomBreakfastStatus = (log && log.breakfast && log.breakfast.submitted) ? 'Completed' : (log && log.breakfast ? 'In Progress' : 'Not Started');
           const finalStatus = (log && log.final && log.final.submitted) ? 'Completed' : (log && log.final ? 'In Progress' : 'Not Started');
           const verified = !!(log && log.verified);
+          // Admin-configured required counts (Admin -> Classrooms) override the default
+          // pre/breakfast/final trio entirely: only show the badges for stages actually enabled
+          // for this classroom, exactly like the entry-step modal already does.
+          const activeSteps = activeStages(cls);
           return (
             <button
               key={cls.id}
@@ -1371,20 +1424,27 @@ function TeacherOverview({ data, onOpenClassroom, onOpenBreakfastFinal }) {
                 </div>
                 {verified && <Badge status="Verified" />}
               </div>
-              <div className="flex items-center gap-2 mb-1">
-                <span className="text-xs font-medium text-primary-400 uppercase w-28">Today's Lunch Count</span>
-                <Badge status={preStatus} />
-              </div>
-              {!isStaff && (
+              {activeSteps.indexOf('pre') !== -1 && (
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-xs font-medium text-primary-400 uppercase w-28">Today's Lunch Count</span>
+                  <Badge status={preStatus} />
+                </div>
+              )}
+              {activeSteps.indexOf('breakfast') !== -1 && (
                 <div className="flex items-center gap-2 mb-1">
                   <span className="text-xs font-medium text-primary-400 uppercase w-28">Breakfast Pre-Count</span>
                   <Badge status={classroomBreakfastStatus} />
                 </div>
               )}
-              <div className="flex items-center gap-2 mb-3">
-                <span className="text-xs font-medium text-primary-400 uppercase w-28">Final Lunch Count</span>
-                <Badge status={finalStatus} />
-              </div>
+              {activeSteps.indexOf('final') !== -1 && (
+                <div className="flex items-center gap-2 mb-3">
+                  <span className="text-xs font-medium text-primary-400 uppercase w-28">Final Lunch Count</span>
+                  <Badge status={finalStatus} />
+                </div>
+              )}
+              {activeSteps.length === 0 && (
+                <p className="text-xs font-medium text-primary-400 uppercase mb-3">No counts enabled</p>
+              )}
               <p className="text-sm font-light text-primary-600">{roster.length} {isStaff ? 'staff' : 'students'}</p>
             </button>
           );
@@ -1681,7 +1741,7 @@ function StaffEntryCard({ student, entry, onChange, disabled }) {
   return (
     <div className={"relative rounded-2xl card-shadow p-4 border flex items-center justify-between gap-3 transition-fast " + (e.attending ? 'bg-green-50 border-green-300' : 'bg-white border-primary-100')}>
       <p className="font-semibold text-primary-900 truncate">
-        <span className="text-primary-400 font-medium">#{student.number}</span> {student.firstName} {student.lastName}
+        {student.position ? <span className="text-primary-400 font-medium">{student.position} &middot; </span> : null}{student.firstName} {student.lastName}
       </p>
       <div className="flex gap-2 shrink-0">
         {[[true,'Yes'],[false,'No']].map(([val,label]) => (
@@ -1847,7 +1907,7 @@ function StaffReviewCard({ student, entry, onChange }) {
   const e = entry || defaultStaffEntry();
   return (
     <div className="bg-white rounded-xl card-shadow border border-primary-100 p-3 flex items-center gap-3">
-      <p className="font-medium text-primary-900 truncate text-sm flex-1 min-w-0"><span className="text-primary-400">#{student.number}</span> {student.firstName} {student.lastName}</p>
+      <p className="font-medium text-primary-900 truncate text-sm flex-1 min-w-0">{student.position ? <span className="text-primary-400">{student.position} &middot; </span> : null}{student.firstName} {student.lastName}</p>
       <select
         value={e.attending ? 'yes' : 'no'}
         onChange={ev => onChange({ attending: ev.target.value === 'yes' })}
@@ -2238,7 +2298,7 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
   const activeAdultsCount = stage === 'final' ? finalAdultsCount : preAdultsCount;
   const staffTotals = isStaff ? tallyStaffEntries(activeEntries, roster) : null;
   const totals = isStaff ? null : tallyEntries(activeEntries, roster, stage === 'breakfast' ? defaultBreakfastEntry : defaultEntry);
-  const sortedRoster = sortStudents(roster, sortBy);
+  const sortedRoster = isStaff ? sortStudents(roster, 'order') : sortStudents(roster, sortBy);
   const stageLabels = { pre: "Today's Lunch Count", breakfast: 'Breakfast Pre-Count', final: "Today's Final Lunch Count" };
 
   return (
@@ -2369,14 +2429,18 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
             </div>
           )}
 
-          <div className="flex items-center justify-end gap-2 mb-4">
-            <label className="text-xs font-medium text-primary-500 uppercase">Sort by</label>
-            <select value={sortBy} onChange={e => setSortBy(e.target.value)} className="border-2 border-primary-200 rounded-lg px-2 py-1.5 text-sm">
-              <option value="number">Student #</option>
-              <option value="first">First Name</option>
-              <option value="last">Last Name</option>
-            </select>
-          </div>
+          {isStaff ? (
+            <p className="text-xs font-light text-primary-500 mb-4 text-right">Card order is set by your admin under Staff &amp; Adults Management.</p>
+          ) : (
+            <div className="flex items-center justify-end gap-2 mb-4">
+              <label className="text-xs font-medium text-primary-500 uppercase">Sort by</label>
+              <select value={sortBy} onChange={e => setSortBy(e.target.value)} className="border-2 border-primary-200 rounded-lg px-2 py-1.5 text-sm">
+                <option value="number">Student #</option>
+                <option value="first">First Name</option>
+                <option value="last">Last Name</option>
+              </select>
+            </div>
+          )}
 
           <div className={stage === 'final' ? 'flex flex-col gap-4 mb-8 max-w-2xl' : 'grid sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-8'}>
             {sortedRoster.map(s => (
@@ -2463,7 +2527,7 @@ function LunchVerificationTab({ data }) {
   const [collapsed, setCollapsed] = useState({});
 
   function toggleExpand(id) { setExpanded(prev => ({ ...prev, [id]: !prev[id] })); }
-  function toggleCollapse(id) { setCollapsed(prev => ({ ...prev, [id]: !prev[id] })); }
+  function toggleCollapse(id) { toggleSection(setCollapsed, id); }
 
   async function verifyClassroom(cls) {
     const log = data.logsById[logId(dateVal, cls.id)];
@@ -2539,7 +2603,7 @@ function LunchVerificationTab({ data }) {
             const finalSubmitted = !!(log && log.final && log.final.submitted);
             const verified = !!(log && log.verified);
             const status = verified ? 'Verified' : (finalSubmitted ? 'Completed' : (preSubmitted ? 'In Progress' : 'Not Started'));
-            const isCollapsed = !!collapsed[cls.id];
+            const isCollapsed = isSectionCollapsed(collapsed, cls.id);
 
             const changedStudents = (!isStaffCls && finalSubmitted) ? roster.filter(s => entryChanged(preEntries[s.id], finalEntries[s.id])) : [];
             const summaryDiffs = [];
@@ -2686,7 +2750,7 @@ function LunchVerificationTab({ data }) {
 function BreakfastVerificationTab({ data }) {
   const [dateVal, setDateVal] = useState(todayStr());
   const [collapsed, setCollapsed] = useState({});
-  function toggleCollapse(id) { setCollapsed(prev => ({ ...prev, [id]: !prev[id] })); }
+  function toggleCollapse(id) { toggleSection(setCollapsed, id); }
 
   function tallyBreakfastFinal(entries, roster) {
     let pickedUp = 0, noShow = 0, absent = 0;
@@ -2771,7 +2835,7 @@ function BreakfastVerificationTab({ data }) {
             const bfSubmitted = !!(bf && bf.submitted);
             const verified = !!(log && log.breakfastVerified);
             const status = verified ? 'Verified' : (bfSubmitted ? 'Completed' : 'Not Started');
-            const isCollapsed = !!collapsed[cls.id];
+            const isCollapsed = isSectionCollapsed(collapsed, cls.id);
 
             return (
               <div key={cls.id} className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
@@ -2851,6 +2915,7 @@ function TodaySnapshotCards({ data }) {
   const pre = useMemo(() => computeTodayPreCountSnapshot(data), [data]);
   const ver = useMemo(() => computeTodayVerifiedSnapshot(data), [data]);
   const staffAdult = useMemo(() => computeTodayStaffAdultSnapshot(data), [data]);
+  const verStaffAdult = useMemo(() => computeTodayVerifiedStaffAdultSnapshot(data), [data]);
   return (
     <div className="grid md:grid-cols-2 gap-4 mb-8">
       <div className="bg-white rounded-2xl card-shadow border-2 border-amber-200 p-5">
@@ -2872,12 +2937,19 @@ function TodaySnapshotCards({ data }) {
       </div>
       <div className="bg-white rounded-2xl card-shadow border-2 border-purple-200 p-5">
         <h4 className="font-bold text-primary-900 mb-1">Today's Verified Count</h4>
-        <p className="text-xs font-light text-primary-500 mb-4">Only populates once an admin verifies a classroom's Final Lunch Count for today.</p>
-        <div className="grid grid-cols-2 gap-3">
-          <StatCard label="Today's Final Hot Lunch" value={ver.hot} />
-          <StatCard label="Today's Final Sack Lunch" value={ver.sack} />
+        <p className="text-xs font-light text-primary-500 mb-4">Only populates once an admin verifies a classroom's Final Lunch Count for today. Mirrors the same markers as Today's PreCount so the two reconcile exactly.</p>
+        <div className="grid grid-cols-3 gap-3 mb-3">
+          <StatCard label="Today's Total Hot Lunch" value={ver.hot} />
+          <StatCard label="Today's Sack Lunch" value={ver.sack} />
           <StatCard label="Today's Absences" value={ver.absent} />
-          <StatCard label="Today's Milk Count" value={ver.milk} />
+        </div>
+        <div className="grid grid-cols-2 gap-3 mb-3">
+          <StatCard label="Hot Lunch Milk" value={ver.milkHot} />
+          <StatCard label="Sack Lunch Milk" value={ver.milkSack} />
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <StatCard label="Staff Lunch" value={verStaffAdult.staffLunch} />
+          <StatCard label="Adult Lunch" value={verStaffAdult.adultLunch} />
         </div>
       </div>
     </div>
@@ -2892,7 +2964,7 @@ function AnalyticsDashboard({ data }) {
   const [customStart, setCustomStart] = useState(todayStr());
   const [customEnd, setCustomEnd] = useState(todayStr());
   const [collapsed, setCollapsed] = useState({});
-  function toggleCollapse(id) { setCollapsed(prev => ({ ...prev, [id]: !prev[id] })); }
+  function toggleCollapse(id) { toggleSection(setCollapsed, id); }
 
   let startDate, endDate, periodLabel, rangeError = null;
 
@@ -2922,12 +2994,6 @@ function AnalyticsDashboard({ data }) {
 
   const agg = useMemo(() => aggregateRange(data, startDate, endDate), [data, startDate.getTime(), endDate.getTime()]);
   const studentAgg = useMemo(() => aggregateRangeByStudent(data, startDate, endDate), [data, startDate.getTime(), endDate.getTime()]);
-
-  const overall = useMemo(() => {
-    let hot = 0, sack = 0, absent = 0, milk = 0;
-    Object.values(agg).forEach(v => { hot += v.hot; sack += v.sack; absent += v.absent; milk += v.milk; });
-    return { hot, sack, absent, milk };
-  }, [agg]);
 
   const sortedClassrooms = useMemo(() => sortClassroomsByGrade(data.classrooms.filter(c => c.type !== 'staff')), [data.classrooms]);
 
@@ -2974,13 +3040,6 @@ function AnalyticsDashboard({ data }) {
         <div className="bg-amber-50 border border-amber-300 text-amber-800 rounded-xl p-4 text-sm font-medium mb-6">{rangeError}</div>
       ) : (
         <React.Fragment>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-8">
-            <StatCard label="Hot Lunches" value={overall.hot} />
-            <StatCard label="Sack Lunches" value={overall.sack} />
-            <StatCard label="Absences" value={overall.absent} />
-            <StatCard label="Milk" value={overall.milk} />
-          </div>
-
           {sortedClassrooms.length === 0 ? (
             <p className="text-sm font-light text-primary-500">No classrooms yet.</p>
           ) : (
@@ -2988,7 +3047,7 @@ function AnalyticsDashboard({ data }) {
               {sortedClassrooms.map(c => {
                 const v = agg[c.id] || { hot: 0, sack: 0, absent: 0, milk: 0 };
                 const roster = sortStudents(data.students.filter(s => s.classroomId === c.id), 'number');
-                const isCollapsed = !!collapsed[c.id];
+                const isCollapsed = isSectionCollapsed(collapsed, c.id);
                 return (
                   <div key={c.id} className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
                     <div className="flex justify-between items-start mb-3 flex-wrap gap-2">
@@ -3277,7 +3336,7 @@ function StudentManagement({ data }) {
   const [sortBy, setSortBy] = useState('classroom');
   const [studentSortBy, setStudentSortBy] = useState('number');
   const [collapsed, setCollapsed] = useState({});
-  function toggleCollapse(id) { setCollapsed(prev => ({ ...prev, [id]: !prev[id] })); }
+  function toggleCollapse(id) { toggleSection(setCollapsed, id); }
 
   const [importRows, setImportRows] = useState(null);
   const [importBusy, setImportBusy] = useState(false);
@@ -3507,7 +3566,7 @@ function StudentManagement({ data }) {
         {visibleClassrooms.map(c => {
           const students = studentsFor(c.id);
           if (search.trim() && students.length === 0) return null;
-          const isCollapsed = !!collapsed[c.id];
+          const isCollapsed = isSectionCollapsed(collapsed, c.id);
           return (
             <div key={c.id} className="bg-white rounded-2xl card-shadow border border-primary-100 overflow-hidden">
               <div onClick={() => toggleCollapse(c.id)} className="w-full bg-primary-50 px-4 py-2.5 border-b border-primary-100 flex items-center gap-3 text-left cursor-pointer">
@@ -3573,18 +3632,28 @@ function StudentManagement({ data }) {
 // classroom) so all of the existing entry-taking / verification / tallying logic works for them
 // without any changes. Lunch status (paid/reduced/free) isn't relevant for staff, so it's left
 // out here and always saved as 'paid'.
+// Common job titles offered as <datalist> suggestions on the Position field below — it's still
+// a free-text input (so any title can be typed), the datalist just makes it behave like a
+// dropdown for the common cases.
+const STAFF_POSITION_SUGGESTIONS = ['Teacher', 'Teacher Aide', 'Administrator', 'Front Office', 'Custodian', 'Cafeteria Staff', 'Nurse', 'Counselor', 'Parent/Volunteer'];
+
 function StaffManagement({ data }) {
   const staffClassrooms = useMemo(() => sortClassroomsByGrade(data.classrooms.filter(c => c.type === 'staff')), [data.classrooms]);
-  const [newNumber, setNewNumber] = useState('');
+  const [newPosition, setNewPosition] = useState('');
   const [newFirst, setNewFirst] = useState('');
   const [newLast, setNewLast] = useState('');
   const [newClass, setNewClass] = useState(staffClassrooms[0] ? staffClassrooms[0].id : '');
   const [editingId, setEditingId] = useState(null);
-  const [editNumber, setEditNumber] = useState('');
+  const [editPosition, setEditPosition] = useState('');
   const [editFirst, setEditFirst] = useState('');
   const [editLast, setEditLast] = useState('');
   const [collapsed, setCollapsed] = useState({});
-  function toggleCollapse(id) { setCollapsed(prev => ({ ...prev, [id]: !prev[id] })); }
+  function toggleCollapse(id) { toggleSection(setCollapsed, id); }
+  // Per-classroom sort choice: 'order' is the admin's manual drag-and-drop order (the order staff
+  // cards will actually appear in the classroom view); 'name' and 'position' are simple alphabetical
+  // sorts for finding someone quickly, without touching the underlying manual order.
+  const [sortByClass, setSortByClass] = useState({});
+  const [dragState, setDragState] = useState({ classroomId: null, draggedId: null });
 
   useEffect(() => {
     if (!newClass && staffClassrooms[0]) setNewClass(staffClassrooms[0].id);
@@ -3594,8 +3663,9 @@ function StaffManagement({ data }) {
   async function addStaff(e) {
     e.preventDefault();
     if (!newFirst.trim() || !newLast.trim() || !newClass) return;
-    await saveStudent({ number: newNumber.trim() || '', firstName: newFirst.trim(), lastName: newLast.trim(), classroomId: newClass, lunchStatus: 'paid' });
-    setNewNumber(''); setNewFirst(''); setNewLast('');
+    const existingCount = data.students.filter(s => s.classroomId === newClass).length;
+    await saveStudent({ position: newPosition.trim(), firstName: newFirst.trim(), lastName: newLast.trim(), classroomId: newClass, lunchStatus: 'paid', sortOrder: existingCount });
+    setNewPosition(''); setNewFirst(''); setNewLast('');
   }
 
   async function deleteStaff(id) {
@@ -3607,12 +3677,42 @@ function StaffManagement({ data }) {
     await saveClassroom({ id: cls.id, grade: cls.grade, teacher: cls.teacher, type: 'staff', showAdultCard: !cls.showAdultCard });
   }
 
-  function startEdit(s) { setEditingId(s.id); setEditNumber(String(s.number || '')); setEditFirst(s.firstName); setEditLast(s.lastName); }
+  function startEdit(s) { setEditingId(s.id); setEditPosition(s.position || ''); setEditFirst(s.firstName); setEditLast(s.lastName); }
   async function saveEdit(id) {
     const s = data.students.find(x => x.id === id);
     if (!s) return;
-    await saveStudent({ id, number: editNumber.trim() || s.number, firstName: editFirst.trim() || s.firstName, lastName: editLast.trim() || s.lastName, classroomId: s.classroomId, lunchStatus: 'paid' });
+    await saveStudent({ id, position: editPosition.trim(), firstName: editFirst.trim() || s.firstName, lastName: editLast.trim() || s.lastName, classroomId: s.classroomId, lunchStatus: 'paid', sortOrder: s.sortOrder });
     setEditingId(null);
+  }
+
+  function sortByFor(classroomId) { return sortByClass[classroomId] || 'order'; }
+  function setSortBy(classroomId, val) { setSortByClass(prev => ({ ...prev, [classroomId]: val })); }
+
+  // Persists a full drag-and-drop reorder: every staff member in the classroom gets a fresh
+  // sortOrder matching their new position in the list, so the classroom view (which orders staff
+  // by sortOrder) reflects the exact order the admin dragged them into.
+  async function persistOrder(classroomId, orderedRoster) {
+    for (let i = 0; i < orderedRoster.length; i++) {
+      const s = orderedRoster[i];
+      if (s.sortOrder !== i) {
+        await saveStudent({ id: s.id, position: s.position || '', firstName: s.firstName, lastName: s.lastName, classroomId: s.classroomId, lunchStatus: s.lunchStatus || 'paid', sortOrder: i });
+      }
+    }
+  }
+
+  function handleDragStart(classroomId, studentId) { setDragState({ classroomId, draggedId: studentId }); }
+  function handleDragOver(e) { e.preventDefault(); }
+  async function handleDrop(classroomId, targetId, currentRoster) {
+    const { draggedId } = dragState;
+    setDragState({ classroomId: null, draggedId: null });
+    if (!draggedId || draggedId === targetId) return;
+    const list = currentRoster.slice();
+    const fromIdx = list.findIndex(s => s.id === draggedId);
+    const toIdx = list.findIndex(s => s.id === targetId);
+    if (fromIdx === -1 || toIdx === -1) return;
+    const [moved] = list.splice(fromIdx, 1);
+    list.splice(toIdx, 0, moved);
+    await persistOrder(classroomId, list);
   }
 
   return (
@@ -3628,10 +3728,14 @@ function StaffManagement({ data }) {
         <p className="text-sm font-light text-primary-500 mb-4">No "Staff &amp; Adults" classroom yet. Create one under Admin &rarr; Classrooms (choose Type: Staff &amp; Adults).</p>
       ) : (
         <React.Fragment>
+          <datalist id="staff-position-suggestions">
+            {STAFF_POSITION_SUGGESTIONS.map(p => <option key={p} value={p} />)}
+          </datalist>
+
           <form onSubmit={addStaff} className="bg-white rounded-2xl card-shadow p-4 border border-primary-100 mb-6 flex flex-wrap gap-3 items-end">
-            <div className="w-24">
-              <label className="text-xs font-medium text-primary-500 uppercase">Staff # (optional)</label>
-              <input value={newNumber} onChange={e => setNewNumber(e.target.value)} placeholder="#" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary" />
+            <div className="w-44">
+              <label className="text-xs font-medium text-primary-500 uppercase">Position</label>
+              <input list="staff-position-suggestions" value={newPosition} onChange={e => setNewPosition(e.target.value)} placeholder="e.g. Custodian" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary" />
             </div>
             <div className="flex-1 min-w-[140px]">
               <label className="text-xs font-medium text-primary-500 uppercase">First Name</label>
@@ -3652,14 +3756,25 @@ function StaffManagement({ data }) {
 
           <div className="grid gap-5">
             {staffClassrooms.map(c => {
-              const roster = sortStudents(data.students.filter(s => s.classroomId === c.id), 'number');
-              const isCollapsed = !!collapsed[c.id];
+              const sortBy = sortByFor(c.id);
+              const roster = sortStudents(data.students.filter(s => s.classroomId === c.id), sortBy);
+              const isCollapsed = isSectionCollapsed(collapsed, c.id);
+              const dragEnabled = sortBy === 'order';
               return (
                 <div key={c.id} className="bg-white rounded-2xl card-shadow border border-primary-100 overflow-hidden">
-                  <div className="w-full bg-primary-50 px-4 py-2.5 border-b border-primary-100 flex items-center gap-3">
+                  <div className="w-full bg-primary-50 px-4 py-2.5 border-b border-primary-100 flex items-center gap-3 flex-wrap">
                     <div onClick={() => toggleCollapse(c.id)} className="flex items-center gap-3 text-left flex-1 min-w-0 cursor-pointer">
                       <CollapseToggle collapsed={isCollapsed} onClick={() => toggleCollapse(c.id)} />
                       <h4 className="font-bold text-primary-900 text-sm">{classroomLabel(c)} <span className="font-light text-primary-500">({roster.length})</span></h4>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <label className="text-xs font-medium text-primary-500 uppercase">Sort</label>
+                      <select value={sortBy} onChange={e => setSortBy(c.id, e.target.value)} className="border-2 border-primary-200 rounded-lg px-2 py-1 text-xs">
+                        <option value="order">Manual Order</option>
+                        <option value="first">Name (First)</option>
+                        <option value="last">Name (Last)</option>
+                        <option value="position">Position</option>
+                      </select>
                     </div>
                     <label className="flex items-center gap-2 text-xs font-semibold text-primary-700 pr-1">
                       <input type="checkbox" checked={!!c.showAdultCard} onChange={() => toggleParentCard(c)} />
@@ -3669,16 +3784,27 @@ function StaffManagement({ data }) {
                   {!isCollapsed && (
                   <div className="divide-y divide-primary-50">
                     {roster.length === 0 && <p className="p-4 text-sm font-light text-primary-500">No staff added yet.</p>}
+                    {dragEnabled && roster.length > 1 && (
+                      <p className="px-4 pt-3 text-xs font-light text-primary-500">Drag &amp; drop rows below (using the ⠿ handle) to set the order staff cards appear in the classroom view.</p>
+                    )}
                     {roster.map(s => (
-                      <div key={s.id} className="flex items-center gap-3 p-4 flex-wrap">
+                      <div
+                        key={s.id}
+                        draggable={dragEnabled && editingId !== s.id}
+                        onDragStart={() => handleDragStart(c.id, s.id)}
+                        onDragOver={dragEnabled ? handleDragOver : undefined}
+                        onDrop={dragEnabled ? () => handleDrop(c.id, s.id, roster) : undefined}
+                        className={"flex items-center gap-3 p-4 flex-wrap " + (dragEnabled ? 'cursor-move' : '')}
+                      >
+                        {dragEnabled && <span className="text-primary-300 select-none" title="Drag to reorder">⠿</span>}
                         {editingId === s.id ? (
                           <React.Fragment>
-                            <input value={editNumber} onChange={e => setEditNumber(e.target.value)} className="border-2 border-primary-200 rounded-lg px-2 py-1 w-20" placeholder="#" autoFocus />
+                            <input list="staff-position-suggestions" value={editPosition} onChange={e => setEditPosition(e.target.value)} className="border-2 border-primary-200 rounded-lg px-2 py-1 w-36" placeholder="Position" autoFocus />
                             <input value={editFirst} onChange={e => setEditFirst(e.target.value)} className="border-2 border-primary-200 rounded-lg px-2 py-1 flex-1 min-w-[110px]" placeholder="First" />
                             <input value={editLast} onChange={e => setEditLast(e.target.value)} className="border-2 border-primary-200 rounded-lg px-2 py-1 flex-1 min-w-[110px]" placeholder="Last" />
                           </React.Fragment>
                         ) : (
-                          <p className="font-medium text-primary-900 flex-1 min-w-[140px]">{s.number ? <span className="text-primary-400">#{s.number} </span> : null}{s.firstName} {s.lastName}</p>
+                          <p className="font-medium text-primary-900 flex-1 min-w-[140px]">{s.position ? <span className="text-primary-400">{s.position} &middot; </span> : null}{s.firstName} {s.lastName}</p>
                         )}
                         {editingId === s.id ? (
                           <button onClick={() => saveEdit(s.id)} className="px-3 py-1.5 rounded-lg bg-primary text-white text-sm font-semibold">Save</button>
@@ -3706,7 +3832,7 @@ function ClassroomManagement({ data }) {
   const [editingId, setEditingId] = useState(null);
   const [editForm, setEditForm] = useState({ grade: '', teacher: '', type: 'class', showAdultCard: false, enablePre: true, enableBreakfast: true, enableFinal: true });
   const [collapsed, setCollapsed] = useState({});
-  function toggleCollapse(id) { setCollapsed(prev => ({ ...prev, [id]: !prev[id] })); }
+  function toggleCollapse(id) { toggleSection(setCollapsed, id); }
 
   async function addClassroom(e) {
     e.preventDefault();
@@ -3827,10 +3953,10 @@ function ClassroomManagement({ data }) {
               <div>
                 <div className="flex justify-between items-start flex-wrap gap-2">
                   <div onClick={() => toggleCollapse(c.id)} className="flex items-center gap-3 text-left flex-1 min-w-0 cursor-pointer">
-                    <CollapseToggle collapsed={!!collapsed[c.id]} onClick={() => toggleCollapse(c.id)} />
+                    <CollapseToggle collapsed={isSectionCollapsed(collapsed, c.id)} onClick={() => toggleCollapse(c.id)} />
                     <div>
                       <p className="font-bold text-primary-900">{c.grade}{c.type === 'staff' && ' 🧑‍🏫'}</p>
-                      {!collapsed[c.id] && (
+                      {!isSectionCollapsed(collapsed, c.id) && (
                         <React.Fragment>
                           <p className="text-sm text-primary-600 font-light">{c.teacher}</p>
                           <p className="text-xs text-primary-400 font-light mt-1">{data.students.filter(s => s.classroomId === c.id).length} {c.type === 'staff' ? 'staff' : 'students'}{c.type === 'staff' && c.showAdultCard ? ' \u00b7 Adult card enabled' : ''}</p>
@@ -3843,7 +3969,7 @@ function ClassroomManagement({ data }) {
                     <button onClick={() => deleteClassroom(c.id)} className="px-3 py-1.5 rounded-lg bg-rose-50 text-rose-600 text-sm font-semibold hover:bg-rose-100">Delete</button>
                   </div>
                 </div>
-                {!collapsed[c.id] && (
+                {!isSectionCollapsed(collapsed, c.id) && (
                   <div className="flex flex-wrap gap-3 mt-3 pt-3 border-t border-primary-50">
                     <label className="flex items-center gap-1.5 text-xs font-semibold text-primary-700">
                       <input type="checkbox" checked={c.enablePre !== false} onChange={() => toggleStage(c, 'enablePre')} />
@@ -4157,6 +4283,11 @@ function StudentRecordEditor({ data }) {
   const [studentId, setStudentId] = useState('');
   const [dateVal, setDateVal] = useState(todayStr());
   const [busy, setBusy] = useState(false);
+  // Locally-staged, not-yet-saved edits per stage. null for a stage means "no pending edit —
+  // show whatever's actually saved in the log". Cleared whenever classroom/student/date changes,
+  // or once a Confirm Changes save succeeds for that stage.
+  const [draft, setDraft] = useState({ pre: null, breakfast: null, final: null });
+  const [confirmedStage, setConfirmedStage] = useState(null);
 
   const roster = useMemo(() => sortStudents(data.students.filter(s => s.classroomId === classroomId), 'number'), [data.students, classroomId]);
 
@@ -4166,12 +4297,23 @@ function StudentRecordEditor({ data }) {
     // eslint-disable-next-line
   }, [classroomId, data.students]);
 
+  // Switching classroom, student, or date abandons any unconfirmed edits rather than silently
+  // carrying them over to a different record.
+  useEffect(() => {
+    setDraft({ pre: null, breakfast: null, final: null });
+    // eslint-disable-next-line
+  }, [classroomId, studentId, dateVal]);
+
   const log = data.logsById[logId(dateVal, classroomId)];
   const preEntry = (log && log.pre && log.pre.entries && log.pre.entries[studentId]) || null;
   const breakfastEntry = (log && log.breakfast && log.breakfast.entries && log.breakfast.entries[studentId]) || null;
   const finalEntry = (log && log.final && log.final.entries && log.final.entries[studentId]) || null;
 
-  async function saveEntry(stageKey, entry) {
+  function setDraftFor(stageKey, entry) {
+    setDraft(prev => ({ ...prev, [stageKey]: entry }));
+  }
+
+  async function confirmChanges(stageKey, entry) {
     if (!log) { alert("There is no saved record for this classroom on this date yet."); return; }
     setBusy(true);
     const basePre = log.pre || { entries: {}, submitted: false, submittedAt: null };
@@ -4212,6 +4354,8 @@ function StudentRecordEditor({ data }) {
       });
     }
     setBusy(false);
+    setDraftFor(stageKey, null);
+    setConfirmedStage(stageKey);
   }
 
   async function clearEntry(stageKey) {
@@ -4221,58 +4365,75 @@ function StudentRecordEditor({ data }) {
     setBusy(true);
     await clearStudentFromLogs([log], studentId, stageKey);
     setBusy(false);
+    setDraftFor(stageKey, null);
   }
 
-  function EntryEditor({ label, entry, stageKey, kind, isStaff }) {
+  function EntryEditor({ label, savedEntry, stageKey, kind, isStaff }) {
+    const draftEntry = draft[stageKey];
+    const hasPendingChanges = draftEntry !== null;
     if (isStaff) {
-      const e = entry || defaultStaffEntry();
+      const e = draftEntry || savedEntry || defaultStaffEntry();
       return (
         <div className="bg-primary-50 rounded-xl p-4">
-          <p className="text-xs font-semibold text-primary-700 uppercase mb-2">{label}{!entry && ' (no entry saved)'}</p>
-          <div className="flex flex-wrap gap-2">
-            <button onClick={() => saveEntry(stageKey, { attending: true })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (e.attending ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>Yes</button>
-            <button onClick={() => saveEntry(stageKey, { attending: false })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (!e.attending ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>No</button>
-            {entry && <button onClick={() => clearEntry(stageKey)} className="px-3 py-1.5 rounded-lg text-xs font-semibold border-2 bg-white text-rose-600 border-rose-200">Remove Entry</button>}
+          <p className="text-xs font-semibold text-primary-700 uppercase mb-2">{label}{!savedEntry && !hasPendingChanges && ' (no entry saved)'}</p>
+          <div className="flex flex-wrap gap-2 mb-2">
+            <button onClick={() => setDraftFor(stageKey, { attending: true })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (e.attending ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>Yes</button>
+            <button onClick={() => setDraftFor(stageKey, { attending: false })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (!e.attending ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>No</button>
+            {savedEntry && <button onClick={() => clearEntry(stageKey)} className="px-3 py-1.5 rounded-lg text-xs font-semibold border-2 bg-white text-rose-600 border-rose-200">Remove Entry</button>}
           </div>
+          {hasPendingChanges && (
+            <button onClick={() => confirmChanges(stageKey, e)} disabled={busy} className="w-full px-3 py-2 rounded-lg text-sm font-bold bg-green-600 text-white hover:bg-green-700 disabled:opacity-50">
+              Confirm Changes
+            </button>
+          )}
         </div>
       );
     }
     const isBreakfast = kind === 'breakfast';
-    const e = entry || (isBreakfast ? defaultBreakfastEntry() : defaultEntry());
+    const e = draftEntry || savedEntry || (isBreakfast ? defaultBreakfastEntry() : defaultEntry());
     return (
       <div className="bg-primary-50 rounded-xl p-4">
-        <p className="text-xs font-semibold text-primary-700 uppercase mb-2">{label}{!entry && ' (no entry saved)'}</p>
-        <div className="flex flex-wrap gap-2">
-          <button onClick={() => saveEntry(stageKey, { ...e, absent: !e.absent })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (e.absent ? 'bg-rose-600 text-white border-rose-600' : 'bg-white text-rose-600 border-rose-200')}>
+        <p className="text-xs font-semibold text-primary-700 uppercase mb-2">{label}{!savedEntry && !hasPendingChanges && ' (no entry saved)'}</p>
+        <div className="flex flex-wrap gap-2 mb-2">
+          <button onClick={() => setDraftFor(stageKey, { ...e, absent: !e.absent })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (e.absent ? 'bg-rose-600 text-white border-rose-600' : 'bg-white text-rose-600 border-rose-200')}>
             {e.absent ? 'Absent' : 'Mark Absent'}
           </button>
           {!e.absent && (
             <React.Fragment>
-              <button onClick={() => saveEntry(stageKey, { ...e, meal: 'hot', milk: e.milk === 'no' ? 'no' : 'yes' })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (e.meal === 'hot' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>{isBreakfast ? 'Breakfast' : 'Hot Lunch'}</button>
-              <button onClick={() => saveEntry(stageKey, { ...e, meal: 'sack' })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (e.meal === 'sack' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>{isBreakfast ? 'No Breakfast' : 'Sack Lunch'}</button>
+              <button onClick={() => setDraftFor(stageKey, { ...e, meal: 'hot', milk: e.milk === 'no' ? 'no' : 'yes' })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (e.meal === 'hot' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>{isBreakfast ? 'Breakfast' : 'Hot Lunch'}</button>
+              <button onClick={() => setDraftFor(stageKey, { ...e, meal: 'sack' })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (e.meal === 'sack' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>{isBreakfast ? 'No Breakfast' : 'Sack Lunch'}</button>
               {!isBreakfast && (
-                <button onClick={() => saveEntry(stageKey, { ...e, milk: e.milk === 'yes' ? 'no' : 'yes' })} className="px-3 py-1.5 rounded-lg text-xs font-semibold border-2 bg-white text-primary-700 border-primary-200">
-                  Milk: {e.milk === 'yes' ? 'Yes' : 'No'} (tap to toggle)
-                </button>
+                <React.Fragment>
+                  <span className="w-full basis-full h-0"></span>
+                  <span className="text-xs font-semibold text-primary-500 self-center mr-1">Milk:</span>
+                  <button onClick={() => setDraftFor(stageKey, { ...e, milk: 'yes' })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (e.milk === 'yes' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>Yes</button>
+                  <button onClick={() => setDraftFor(stageKey, { ...e, milk: 'no' })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (e.milk === 'no' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>No</button>
+                </React.Fragment>
               )}
             </React.Fragment>
           )}
-          {entry && <button onClick={() => clearEntry(stageKey)} className="px-3 py-1.5 rounded-lg text-xs font-semibold border-2 bg-white text-rose-600 border-rose-200">Remove Entry</button>}
+          {savedEntry && <button onClick={() => clearEntry(stageKey)} className="px-3 py-1.5 rounded-lg text-xs font-semibold border-2 bg-white text-rose-600 border-rose-200">Remove Entry</button>}
         </div>
+        {hasPendingChanges && (
+          <button onClick={() => confirmChanges(stageKey, e)} disabled={busy} className="w-full px-3 py-2 rounded-lg text-sm font-bold bg-green-600 text-white hover:bg-green-700 disabled:opacity-50">
+            Confirm Changes
+          </button>
+        )}
       </div>
     );
   }
 
   const breakfastTargetLabel = log && log.breakfast && log.breakfast.targetDate ? formatShortDate(log.breakfast.targetDate) : formatShortDate(nextSchoolDay(data.settings, dateVal));
   const isStaffClassroom = (data.classrooms.find(c => c.id === classroomId) || {}).type === 'staff';
+  const confirmedLabels = { pre: "Today's Lunch Count", breakfast: 'Breakfast Pre-Count', final: "Today's Final Lunch Count" };
 
   return (
     <div>
       <h3 className="text-xl font-bold text-primary-900 mb-4">Edit or Remove One Student's Record</h3>
       <p className="text-sm font-light text-primary-600 mb-4">
         Fix a mistake for a single student on a single day without touching anyone else's counts.
-        Editing the final count automatically un-verifies that day, so it's clear the
-        finalized number changed.
+        Make your changes below, then tap Confirm Changes to save them. Editing the final count
+        automatically un-verifies that day, so it's clear the finalized number changed.
       </p>
       <div className="flex flex-wrap gap-4 items-end mb-4">
         <div>
@@ -4284,7 +4445,7 @@ function StudentRecordEditor({ data }) {
         <div>
           <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Student</label>
           <select value={studentId} onChange={e => setStudentId(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2">
-            {roster.map(s => <option key={s.id} value={s.id}>#{s.number} {s.firstName} {s.lastName}</option>)}
+            {roster.map(s => <option key={s.id} value={s.id}>{s.position ? (s.position + ' \u2013 ') : (s.number ? ('#' + s.number + ' ') : '')}{s.firstName} {s.lastName}</option>)}
           </select>
         </div>
         <div>
@@ -4299,12 +4460,20 @@ function StudentRecordEditor({ data }) {
         <p className="text-sm font-light text-primary-500">This classroom has no students yet.</p>
       ) : (
         <div className={"grid gap-4 " + (isStaffClassroom ? 'sm:grid-cols-2' : 'sm:grid-cols-3')}>
-          <EntryEditor label="Today's Lunch Count" entry={preEntry} stageKey="pre" kind="lunch" isStaff={isStaffClassroom} />
-          {!isStaffClassroom && <EntryEditor label={"Breakfast Pre-Count (for " + breakfastTargetLabel + ")"} entry={breakfastEntry} stageKey="breakfast" kind="breakfast" />}
-          <EntryEditor label="Today's Final Lunch Count" entry={finalEntry} stageKey="final" kind="lunch" isStaff={isStaffClassroom} />
+          <EntryEditor label="Today's Lunch Count" savedEntry={preEntry} stageKey="pre" kind="lunch" isStaff={isStaffClassroom} />
+          {!isStaffClassroom && <EntryEditor label={"Breakfast Pre-Count (for " + breakfastTargetLabel + ")"} savedEntry={breakfastEntry} stageKey="breakfast" kind="breakfast" />}
+          <EntryEditor label="Today's Final Lunch Count" savedEntry={finalEntry} stageKey="final" kind="lunch" isStaff={isStaffClassroom} />
         </div>
       )}
       {busy && <p className="text-xs text-primary-400 mt-2">Saving…</p>}
+
+      {confirmedStage && (
+        <SuccessModal
+          title="Changes Confirmed"
+          message={confirmedLabels[confirmedStage] + " has been updated for this student on " + formatShortDate(dateVal) + "."}
+          onDone={() => setConfirmedStage(null)}
+        />
+      )}
     </div>
   );
 }
