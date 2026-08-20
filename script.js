@@ -2099,8 +2099,15 @@ function LunchVerificationTab({ data }) {
 
   async function verifyClassroom(cls) {
     const log = data.logsById[logId(dateVal, cls.id)];
-    if (!log || !log.final || !log.final.submitted) { alert('The final count has not been submitted yet for this classroom.'); return; }
-    await saveLogFull(dateVal, cls.id, { ...log, verified: true, verifiedAt: new Date().toISOString() });
+    const finalSubmitted = !!(log && log.final && log.final.submitted);
+    if (!finalSubmitted) {
+      const proceed = confirm(
+        'The Lunch Final Count for ' + classroomLabel(cls) + ' has not been submitted (or was not submitted properly) for ' +
+        formatDisplayDate(dateVal) + '.\n\nVerify and finalize it anyway?'
+      );
+      if (!proceed) return;
+    }
+    await saveLogFull(dateVal, cls.id, { ...(log || {}), verified: true, verifiedAt: new Date().toISOString() });
   }
   async function unverifyClassroom(cls) {
     const log = data.logsById[logId(dateVal, cls.id)];
@@ -2108,15 +2115,34 @@ function LunchVerificationTab({ data }) {
     await saveLogFull(dateVal, cls.id, { ...log, verified: false, verifiedAt: null });
   }
   async function verifyAll() {
-    const eligible = data.classrooms.filter(cls => {
+    const unverified = data.classrooms.filter(cls => {
       const log = data.logsById[logId(dateVal, cls.id)];
-      return log && log.final && log.final.submitted && !log.verified;
+      return !(log && log.verified);
     });
-    if (eligible.length === 0) { alert('No submitted, unverified classrooms to finalize for this date.'); return; }
-    if (!confirm('Verify and finalize ' + eligible.length + ' classroom(s) for ' + formatDisplayDate(dateVal) + '?')) return;
-    for (const cls of eligible) {
+    if (unverified.length === 0) { alert('No unverified classrooms remain for this date.'); return; }
+    const submitted = unverified.filter(cls => {
       const log = data.logsById[logId(dateVal, cls.id)];
-      await saveLogFull(dateVal, cls.id, { ...log, verified: true, verifiedAt: new Date().toISOString() });
+      return !!(log && log.final && log.final.submitted);
+    });
+    const notSubmitted = unverified.filter(cls => submitted.indexOf(cls) === -1);
+
+    let toVerify;
+    if (notSubmitted.length === 0) {
+      if (!confirm('Verify and finalize ' + submitted.length + ' classroom(s) for ' + formatDisplayDate(dateVal) + '?')) return;
+      toVerify = submitted;
+    } else {
+      const names = notSubmitted.map(classroomLabel).join(', ');
+      const proceed = confirm(
+        'The following classroom(s) have not submitted (or did not submit properly) a Lunch Final Count for ' +
+        formatDisplayDate(dateVal) + ':\n\n' + names +
+        '\n\nClick Cancel to leave them unverified, or OK to verify and finalize ALL ' + unverified.length + ' classroom(s) anyway, including these.'
+      );
+      if (!proceed) return;
+      toVerify = unverified;
+    }
+    for (const cls of toVerify) {
+      const log = data.logsById[logId(dateVal, cls.id)];
+      await saveLogFull(dateVal, cls.id, { ...(log || {}), verified: true, verifiedAt: new Date().toISOString() });
     }
   }
 
@@ -2124,7 +2150,7 @@ function LunchVerificationTab({ data }) {
     <div>
       <div className="flex items-center gap-3 mb-6 flex-wrap">
         <input type="date" value={dateVal} onChange={e => setDateVal(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
-        <PrimaryButton onClick={verifyAll}>Verify &amp; Finalize All Submitted</PrimaryButton>
+        <PrimaryButton onClick={verifyAll}>Verify &amp; Finalize All</PrimaryButton>
       </div>
 
       {data.classrooms.length === 0 ? (
@@ -2237,7 +2263,7 @@ function LunchVerificationTab({ data }) {
                   {verified ? (
                     <GhostButton onClick={() => unverifyClassroom(cls)}>Unlock (Undo Verification)</GhostButton>
                   ) : (
-                    <PrimaryButton disabled={!finalSubmitted} onClick={() => verifyClassroom(cls)}>Verify &amp; Finalize</PrimaryButton>
+                    <PrimaryButton onClick={() => verifyClassroom(cls)}>Verify &amp; Finalize</PrimaryButton>
                   )}
                 </div>
               </div>
@@ -2268,8 +2294,15 @@ function BreakfastVerificationTab({ data }) {
 
   async function verifyClassroom(cls) {
     const log = data.logsById[logId(dateVal, cls.id)];
-    if (!log || !log.breakfastFinal || !log.breakfastFinal.submitted) { alert('Breakfast Verification has not been submitted yet for this classroom on this date.'); return; }
-    await saveLogFull(dateVal, cls.id, { ...log, breakfastVerified: true, breakfastVerifiedAt: new Date().toISOString() });
+    const bfSubmitted = !!(log && log.breakfastFinal && log.breakfastFinal.submitted);
+    if (!bfSubmitted) {
+      const proceed = confirm(
+        'Breakfast Verification for ' + classroomLabel(cls) + ' has not been submitted (or was not submitted properly) for ' +
+        formatDisplayDate(dateVal) + '.\n\nVerify and finalize it anyway?'
+      );
+      if (!proceed) return;
+    }
+    await saveLogFull(dateVal, cls.id, { ...(log || {}), breakfastVerified: true, breakfastVerifiedAt: new Date().toISOString() });
   }
   async function unverifyClassroom(cls) {
     const log = data.logsById[logId(dateVal, cls.id)];
@@ -2277,15 +2310,34 @@ function BreakfastVerificationTab({ data }) {
     await saveLogFull(dateVal, cls.id, { ...log, breakfastVerified: false, breakfastVerifiedAt: null });
   }
   async function verifyAll() {
-    const eligible = data.classrooms.filter(cls => {
+    const unverified = data.classrooms.filter(cls => {
       const log = data.logsById[logId(dateVal, cls.id)];
-      return log && log.breakfastFinal && log.breakfastFinal.submitted && !log.breakfastVerified;
+      return !(log && log.breakfastVerified);
     });
-    if (eligible.length === 0) { alert('No submitted, unverified Breakfast Verifications to finalize for this date.'); return; }
-    if (!confirm('Verify and finalize Breakfast Verification for ' + eligible.length + ' classroom(s) for ' + formatDisplayDate(dateVal) + '?')) return;
-    for (const cls of eligible) {
+    if (unverified.length === 0) { alert('No unverified Breakfast Verifications remain for this date.'); return; }
+    const submitted = unverified.filter(cls => {
       const log = data.logsById[logId(dateVal, cls.id)];
-      await saveLogFull(dateVal, cls.id, { ...log, breakfastVerified: true, breakfastVerifiedAt: new Date().toISOString() });
+      return !!(log && log.breakfastFinal && log.breakfastFinal.submitted);
+    });
+    const notSubmitted = unverified.filter(cls => submitted.indexOf(cls) === -1);
+
+    let toVerify;
+    if (notSubmitted.length === 0) {
+      if (!confirm('Verify and finalize Breakfast Verification for ' + submitted.length + ' classroom(s) for ' + formatDisplayDate(dateVal) + '?')) return;
+      toVerify = submitted;
+    } else {
+      const names = notSubmitted.map(classroomLabel).join(', ');
+      const proceed = confirm(
+        'The following classroom(s) have not submitted (or did not submit properly) a Breakfast Verification for ' +
+        formatDisplayDate(dateVal) + ':\n\n' + names +
+        '\n\nClick Cancel to leave them unverified, or OK to verify and finalize ALL ' + unverified.length + ' classroom(s) anyway, including these.'
+      );
+      if (!proceed) return;
+      toVerify = unverified;
+    }
+    for (const cls of toVerify) {
+      const log = data.logsById[logId(dateVal, cls.id)];
+      await saveLogFull(dateVal, cls.id, { ...(log || {}), breakfastVerified: true, breakfastVerifiedAt: new Date().toISOString() });
     }
   }
 
@@ -2293,7 +2345,7 @@ function BreakfastVerificationTab({ data }) {
     <div>
       <div className="flex items-center gap-3 mb-6 flex-wrap">
         <input type="date" value={dateVal} onChange={e => setDateVal(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
-        <PrimaryButton onClick={verifyAll}>Verify &amp; Finalize All Submitted</PrimaryButton>
+        <PrimaryButton onClick={verifyAll}>Verify &amp; Finalize All</PrimaryButton>
       </div>
 
       {data.classrooms.length === 0 ? (
@@ -2340,7 +2392,7 @@ function BreakfastVerificationTab({ data }) {
                   {verified ? (
                     <GhostButton onClick={() => unverifyClassroom(cls)}>Unlock (Undo Verification)</GhostButton>
                   ) : (
-                    <PrimaryButton disabled={!bfSubmitted} onClick={() => verifyClassroom(cls)}>Verify &amp; Finalize</PrimaryButton>
+                    <PrimaryButton onClick={() => verifyClassroom(cls)}>Verify &amp; Finalize</PrimaryButton>
                   )}
                 </div>
               </div>
