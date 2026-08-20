@@ -252,6 +252,20 @@ function tallyEntries(entries, roster, defaultEntryFn) {
   });
   return { hot, sack, absent, milk, total: roster.length };
 }
+// Like tallyEntries, but splits milk counts out by meal type (hot vs sack) instead of a single
+// combined milk total. Used by the Admin Analytics "Today" snapshot cards, where hot-lunch milk
+// and sack-lunch milk are reported separately.
+function tallyEntriesSplitMilk(entries, roster, defaultEntryFn) {
+  const fallback = defaultEntryFn || defaultEntry;
+  let hot = 0, sack = 0, absent = 0, milkHot = 0, milkSack = 0;
+  roster.forEach(s => {
+    const e = (entries && entries[s.id]) || fallback();
+    if (e.absent) { absent++; return; }
+    if (e.meal === 'hot') { hot++; if (e.milk === 'yes') milkHot++; }
+    else if (e.meal === 'sack') { sack++; if (e.milk === 'yes') milkSack++; }
+  });
+  return { hot, sack, absent, milkHot, milkSack, total: roster.length };
+}
 function entryChanged(preE, finalE) {
   const a = preE || defaultEntry(), b = finalE || defaultEntry();
   return a.absent !== b.absent || a.meal !== b.meal || a.milk !== b.milk;
@@ -322,6 +336,9 @@ function gradeSortRank(grade) {
 }
 function sortClassroomsByGrade(list) {
   return (list || []).slice().sort((a, b) => {
+    // Staff & Adults classrooms always sort to the end, after every real grade.
+    const aStaff = a.type === 'staff', bStaff = b.type === 'staff';
+    if (aStaff !== bStaff) return aStaff ? 1 : -1;
     const ra = gradeSortRank(a.grade), rb = gradeSortRank(b.grade);
     if (ra !== rb) return ra - rb;
     return (a.grade || '').localeCompare(b.grade || '', undefined, { numeric: true }) || (a.teacher || '').localeCompare(b.teacher || '');
@@ -445,7 +462,12 @@ function useLogs() {
 
 async function saveClassroom(cls) {
   const id = cls.id || uid('c');
-  await db.collection('classrooms').doc(id).set({ grade: cls.grade, teacher: cls.teacher });
+  await db.collection('classrooms').doc(id).set({
+    grade: cls.grade,
+    teacher: cls.teacher,
+    type: cls.type || 'class',
+    showAdultCard: !!cls.showAdultCard
+  });
   return id;
 }
 async function deleteClassroomDoc(id) { await db.collection('classrooms').doc(id).delete(); }
@@ -478,6 +500,11 @@ async function saveSettings(patch) {
 // are the admin's sign-off on that, exactly parallel to verified/verifiedAt for lunch. Every
 // caller of saveLogFull MUST pass these through from the existing log doc (when one exists) or
 // they will silently reset to blank/false, since this function always writes a full document.
+//
+// pre.adultsCount / final.adultsCount: for "Staff & Adults" classrooms with the adult/parent
+// card enabled, a simple running count of adults eating lunch that day, separate from the
+// per-person roster entries above. Lives inside the pre/final objects themselves so no schema
+// change is needed elsewhere.
 async function saveLogFull(dateStr, classroomId, obj) {
   const id = logId(dateStr, classroomId);
   const payload = {
@@ -613,9 +640,12 @@ async function promoteClassroom(data, fromClassroomId, toClassroomId) {
 }
 
 /* ============================ AGGREGATION (ANALYTICS + EXPORT) ============================ */
+// Everywhere below explicitly excludes "Staff & Adults" classrooms (cls.type === 'staff') from
+// student meal-count reporting: those classrooms track adult/staff lunches, which shouldn't be
+// mixed into student reimbursement analytics or the official Monthly Meal Count Export.
 function aggregateRange(data, startDate, endDate) {
   const result = {};
-  data.classrooms.forEach(c => { result[c.id] = { hot: 0, sack: 0, absent: 0, milk: 0 }; });
+  data.classrooms.forEach(c => { if (c.type !== 'staff') result[c.id] = { hot: 0, sack: 0, absent: 0, milk: 0 }; });
   data.logs.forEach(log => {
     const d = parseDateStr(log.date);
     if (d < startDate || d > endDate) return;
@@ -631,8 +661,9 @@ function aggregateRange(data, startDate, endDate) {
   return result;
 }
 function aggregateRangeByStudent(data, startDate, endDate) {
+  const staffClassroomIds = new Set(data.classrooms.filter(c => c.type === 'staff').map(c => c.id));
   const result = {};
-  data.students.forEach(s => { result[s.id] = { hot: 0, sack: 0, absent: 0, milk: 0 }; });
+  data.students.forEach(s => { if (!staffClassroomIds.has(s.classroomId)) result[s.id] = { hot: 0, sack: 0, absent: 0, milk: 0 }; });
   data.logs.forEach(log => {
     const d = parseDateStr(log.date);
     if (d < startDate || d > endDate) return;
@@ -649,6 +680,39 @@ function aggregateRangeByStudent(data, startDate, endDate) {
   return result;
 }
 
+/* ============================ TODAY SNAPSHOT (ADMIN ANALYTICS "TODAY" CARDS) ============================ */
+// Live, cross-classroom snapshot for today only, powering the two Analytics cards: a
+// PreCount card (fills in live as teachers work through Today's Lunch Count, before anyone
+// submits or verifies anything) and a Verified Count card (only counts classroom-days an admin
+// has actually verified). Staff & Adults classrooms are excluded, same reasoning as
+// aggregateRange above.
+function computeTodayPreCountSnapshot(data) {
+  const today = todayStr();
+  let hot = 0, sack = 0, absent = 0, milkHot = 0, milkSack = 0;
+  data.classrooms.forEach(cls => {
+    if (cls.type === 'staff') return;
+    const roster = data.students.filter(s => s.classroomId === cls.id);
+    const log = data.logsById[logId(today, cls.id)];
+    const entries = (log && log.pre && log.pre.entries) || {};
+    const t = tallyEntriesSplitMilk(entries, roster, defaultEntry);
+    hot += t.hot; sack += t.sack; absent += t.absent; milkHot += t.milkHot; milkSack += t.milkSack;
+  });
+  return { hot, sack, absent, milkHot, milkSack };
+}
+function computeTodayVerifiedSnapshot(data) {
+  const today = todayStr();
+  let hot = 0, sack = 0, absent = 0, milk = 0;
+  data.classrooms.forEach(cls => {
+    if (cls.type === 'staff') return;
+    const log = data.logsById[logId(today, cls.id)];
+    if (!log || !log.verified) return;
+    const roster = data.students.filter(s => s.classroomId === cls.id);
+    const t = tallyEntries((log.final && log.final.entries) || {}, roster);
+    hot += t.hot; sack += t.sack; absent += t.absent; milk += t.milk;
+  });
+  return { hot, sack, absent, milk };
+}
+
 /* ============================ MONTHLY MEAL COUNT EXPORT (matches official template) ============================ */
 // For every day of the given month, tallies how many *not-absent* students on submitted/final
 // logs fall into each reporting bucket: Elementary Paid, Middle School Paid, High School Paid,
@@ -658,6 +722,7 @@ function aggregateRangeByStudent(data, startDate, endDate) {
 // leaves that day's row blank, exactly like the paper form would. Because this reads straight
 // from data.logsById / data.students (live Firestore data), anything deleted or edited in Admin
 // -> Data Management is reflected here automatically the next time this is computed.
+// Staff & Adults classrooms are excluded (see AGGREGATION note above).
 function buildMonthlyMealCountDays(data, year, month) {
   const numDays = daysInMonth(year, month);
   const days = [];
@@ -667,6 +732,7 @@ function buildMonthlyMealCountDays(data, year, month) {
     let hasData = false;
     const counts = { elem: 0, mid: 0, high: 0, reduced: 0, free: 0 };
     data.classrooms.forEach(cls => {
+      if (cls.type === 'staff') return;
       const log = data.logsById[logId(dateStr, cls.id)];
       if (!log || !log.final || !log.final.submitted) return;
       hasData = true;
@@ -795,7 +861,7 @@ function buildMonthlyBreakfastCountDays(data, year, month) {
     const bucket = days[day - 1];
     if (!bucket) return;
     const cls = data.classrooms.find(c => c.id === log.classroomId);
-    if (!cls) return;
+    if (!cls || cls.type === 'staff') return;
     bucket.hasData = true;
     const band = bandForGrade(data.settings, cls.grade);
     const roster = data.students.filter(s => s.classroomId === cls.id);
@@ -898,6 +964,23 @@ function StatCard({ label, value }) {
   );
 }
 
+// A small chevron-in-a-circle button used to collapse/expand a classroom card across the
+// various Admin panels (Verification, Analytics, Student Management). Purely a UI toggle -
+// collapsing never affects underlying data, just what's rendered.
+function CollapseToggle({ collapsed, onClick, label }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={collapsed ? 'Expand' : 'Collapse'}
+      className="shrink-0 w-8 h-8 rounded-full bg-primary-50 text-primary-600 hover:bg-primary-100 flex items-center justify-center font-bold text-sm transition-fast"
+      aria-label={label || (collapsed ? 'Expand' : 'Collapse')}
+    >
+      {collapsed ? '▸' : '▾'}
+    </button>
+  );
+}
+
 function FloatingSummary({ totals, hideMilk }) {
   return (
     <div className="hidden lg:flex flex-col gap-2 fixed left-4 top-28 z-30 bg-white rounded-2xl card-shadow-lg border border-primary-100 p-4 w-36">
@@ -968,6 +1051,36 @@ function SuccessModal({ title, message, onDone, children }) {
             Back to Home
           </button>
         )}
+      </div>
+    </div>
+  );
+}
+
+// Simple plus/minus counter card used for the "Staff & Adults" classroom's adult/parent lunch
+// count. count is a plain number (>= 0); onChange receives the new number.
+function AdultsCounterCard({ count, onChange, disabled, label }) {
+  const c = count || 0;
+  function set(next) { if (!disabled) onChange(Math.max(0, next)); }
+  return (
+    <div className="rounded-2xl card-shadow p-5 border-2 border-dashed border-primary-200 bg-primary-50 flex items-center justify-between gap-4 max-w-sm">
+      <div>
+        <p className="font-bold text-primary-900">{label || 'Adults / Parents Eating'}</p>
+        <p className="text-xs font-light text-primary-500">Tap +/- to adjust the count</p>
+      </div>
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => set(c - 1)}
+          className="btn-touch w-11 h-11 rounded-full bg-white border-2 border-primary-300 text-primary-700 font-bold text-xl flex items-center justify-center hover:bg-primary-100 disabled:opacity-40"
+        >−</button>
+        <span className="text-2xl font-bold text-primary-900 w-8 text-center">{c}</span>
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => set(c + 1)}
+          className="btn-touch w-11 h-11 rounded-full bg-white border-2 border-primary-300 text-primary-700 font-bold text-xl flex items-center justify-center hover:bg-primary-100 disabled:opacity-40"
+        >+</button>
       </div>
     </div>
   );
@@ -1162,13 +1275,14 @@ function TeacherOverview({ data, onOpenClassroom, onOpenBreakfastFinal }) {
     <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
       <div className="mb-6">
         <h2 className="text-2xl font-bold text-primary-900">Today is {formatDisplayDate(today)}</h2>
-        <p className="text-primary-600 font-light">Select a classroom to take the lunch pre-count, breakfast pre-count, or lunch final count.</p>
+        <p className="text-primary-600 font-light">Select a classroom to take Today's Lunch Count, the Breakfast Pre-Count, or Today's Final Lunch Count.</p>
       </div>
 
       {noSchool && <NoSchoolBanner label={holiday && holiday.label} />}
 
       <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-5">
         {sortedClassrooms.map(cls => {
+          const isStaff = cls.type === 'staff';
           const roster = data.students.filter(s => s.classroomId === cls.id);
           const log = data.logsById[logId(today, cls.id)];
           const preStatus = (log && log.pre && log.pre.submitted) ? 'Completed' : (log && log.pre ? 'In Progress' : 'Not Started');
@@ -1184,24 +1298,26 @@ function TeacherOverview({ data, onOpenClassroom, onOpenBreakfastFinal }) {
             >
               <div className="flex justify-between items-start mb-3">
                 <div>
-                  <h3 className="text-xl font-bold text-primary-900">{cls.grade}</h3>
+                  <h3 className="text-xl font-bold text-primary-900">{cls.grade}{isStaff && ' 🧑‍🏫'}</h3>
                   <p className="text-sm font-medium text-primary-500">{cls.teacher}</p>
                 </div>
                 {verified && <Badge status="Verified" />}
               </div>
               <div className="flex items-center gap-2 mb-1">
-                <span className="text-xs font-medium text-primary-400 uppercase w-28">Lunch Pre-Count</span>
+                <span className="text-xs font-medium text-primary-400 uppercase w-28">Today's Lunch Count</span>
                 <Badge status={preStatus} />
               </div>
-              <div className="flex items-center gap-2 mb-1">
-                <span className="text-xs font-medium text-primary-400 uppercase w-28">Breakfast Pre-Count</span>
-                <Badge status={classroomBreakfastStatus} />
-              </div>
+              {!isStaff && (
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-xs font-medium text-primary-400 uppercase w-28">Breakfast Pre-Count</span>
+                  <Badge status={classroomBreakfastStatus} />
+                </div>
+              )}
               <div className="flex items-center gap-2 mb-3">
-                <span className="text-xs font-medium text-primary-400 uppercase w-28">Lunch Final</span>
+                <span className="text-xs font-medium text-primary-400 uppercase w-28">Final Lunch Count</span>
                 <Badge status={finalStatus} />
               </div>
-              <p className="text-sm font-light text-primary-600">{roster.length} students</p>
+              <p className="text-sm font-light text-primary-600">{roster.length} {isStaff ? 'staff' : 'students'}</p>
             </button>
           );
         })}
@@ -1629,7 +1745,7 @@ function ReviewStudentCard({ student, entry, onChange, kind }) {
   );
 }
 
-function ReviewScreen({ stage, cls, roster, entries, onChangeEntry, onEdit, onSubmit, targetDateLabel }) {
+function ReviewScreen({ stage, cls, roster, entries, onChangeEntry, onEdit, onSubmit, targetDateLabel, adultsCount, onChangeAdults, showAdultCard }) {
   const isBreakfast = stage === 'breakfast';
   const defaultFn = isBreakfast ? defaultBreakfastEntry : defaultEntry;
   const totals = tallyEntries(entries, roster, defaultFn);
@@ -1641,8 +1757,8 @@ function ReviewScreen({ stage, cls, roster, entries, onChangeEntry, onEdit, onSu
     else sackStudents.push(s);
   });
 
-  const titles = { pre: 'Review Lunch Pre-Count', breakfast: 'Review Breakfast Pre-Count', final: 'Review Lunch Final Count' };
-  const submitLabels = { pre: 'Submit Lunch Pre-Count', breakfast: 'Submit Breakfast Pre-Count', final: 'Submit Lunch Final Count' };
+  const titles = { pre: "Review Today's Lunch Count", breakfast: 'Review Breakfast Pre-Count', final: "Review Today's Final Lunch Count" };
+  const submitLabels = { pre: "Submit Today's Lunch Count", breakfast: 'Submit Breakfast Pre-Count', final: "Submit Today's Final Lunch Count" };
   const title = titles[stage];
   const submitLabel = submitLabels[stage];
 
@@ -1666,6 +1782,12 @@ function ReviewScreen({ stage, cls, roster, entries, onChangeEntry, onEdit, onSu
       <p className="text-primary-600 font-light mb-6">
         {cls.grade} &middot; {cls.teacher} &middot; {isBreakfast ? ('For ' + targetDateLabel) : formatDisplayDate(todayStr())}
       </p>
+
+      {showAdultCard && (
+        <div className="mb-6">
+          <AdultsCounterCard count={adultsCount} onChange={onChangeAdults} />
+        </div>
+      )}
 
       <div className={"grid grid-cols-2 gap-3 mb-6 " + (isBreakfast ? 'sm:grid-cols-3' : 'sm:grid-cols-4')}>
         <StatCard label={isBreakfast ? 'Breakfast' : 'Hot Lunch'} value={totals.hot} />
@@ -1713,9 +1835,11 @@ function ReviewScreen({ stage, cls, roster, entries, onChangeEntry, onEdit, onSu
 }
 
 /* ============================ TEACHER: CLASSROOM ENTRY MODAL ============================ */
-// Enforces the required order: Lunch Pre-Count -> Breakfast Pre-Count (for the next school day) ->
-// Lunch Final Count. Each step unlocks only once the one before it has been submitted.
-function ClassroomEntryModal({ cls, preSubmitted, breakfastSubmitted, finalSubmitted, targetDateLabel, onSelectPre, onSelectBreakfast, onSelectFinal, onClose }) {
+// Enforces the required order: Today's Lunch Count -> Breakfast Pre-Count (for the next school day) ->
+// Today's Final Lunch Count. Each step unlocks only once the one before it has been submitted.
+// For "Staff & Adults" classrooms (isStaff), the Breakfast Pre-Count step is skipped entirely -
+// only Today's Lunch Count and Today's Final Lunch Count are offered.
+function ClassroomEntryModal({ cls, isStaff, preSubmitted, breakfastSubmitted, finalSubmitted, targetDateLabel, onSelectPre, onSelectBreakfast, onSelectFinal, onClose }) {
   const [lockedError, setLockedError] = useState('');
 
   function handleBreakfastClick() {
@@ -1723,6 +1847,7 @@ function ClassroomEntryModal({ cls, preSubmitted, breakfastSubmitted, finalSubmi
     onSelectBreakfast();
   }
   function handleFinalClick() {
+    if (isStaff) { if (!preSubmitted) { setLockedError('final'); return; } onSelectFinal(); return; }
     if (!breakfastSubmitted) { setLockedError('final'); return; }
     onSelectFinal();
   }
@@ -1757,24 +1882,26 @@ function ClassroomEntryModal({ cls, preSubmitted, breakfastSubmitted, finalSubmi
           </div>
           <button onClick={onClose} className="text-primary-400 hover:text-primary-700 text-2xl leading-none">&times;</button>
         </div>
-        <p className="text-sm font-light text-primary-600 mb-5 mt-2">Complete these three steps in order.</p>
+        <p className="text-sm font-light text-primary-600 mb-5 mt-2">Complete these steps in order.</p>
 
         <div className="flex flex-col gap-3">
-          <StepButton step="1" label="Lunch Pre-Count" done={preSubmitted} locked={false} onClick={onSelectPre} />
+          <StepButton step="1" label="Today's Lunch Count" done={preSubmitted} locked={false} onClick={onSelectPre} />
+          {!isStaff && (
+            <StepButton
+              step="2"
+              label={"Breakfast Pre-Count (for " + targetDateLabel + ")"}
+              done={breakfastSubmitted}
+              locked={!preSubmitted}
+              sublabel={lockedError === 'breakfast' ? "Submit Today's Lunch Count first." : (preSubmitted && !breakfastSubmitted ? 'Ready for the Breakfast Pre-Count.' : null)}
+              onClick={handleBreakfastClick}
+            />
+          )}
           <StepButton
-            step="2"
-            label={"Breakfast Pre-Count (for " + targetDateLabel + ")"}
-            done={breakfastSubmitted}
-            locked={!preSubmitted}
-            sublabel={lockedError === 'breakfast' ? 'Submit the Lunch Pre-Count first.' : (preSubmitted && !breakfastSubmitted ? 'Ready for the Breakfast Pre-Count.' : null)}
-            onClick={handleBreakfastClick}
-          />
-          <StepButton
-            step="3"
-            label="Lunch Final Count"
+            step={isStaff ? '2' : '3'}
+            label="Today's Final Lunch Count"
             done={finalSubmitted}
-            locked={!breakfastSubmitted}
-            sublabel={lockedError === 'final' ? 'Submit the Breakfast Pre-Count first.' : (breakfastSubmitted && !finalSubmitted ? 'Ready for the Lunch Final Count.' : null)}
+            locked={isStaff ? !preSubmitted : !breakfastSubmitted}
+            sublabel={lockedError === 'final' ? (isStaff ? "Submit Today's Lunch Count first." : 'Submit the Breakfast Pre-Count first.') : ((isStaff ? preSubmitted : breakfastSubmitted) && !finalSubmitted ? "Ready for Today's Final Lunch Count." : null)}
             onClick={handleFinalClick}
           />
         </div>
@@ -1786,12 +1913,15 @@ function ClassroomEntryModal({ cls, preSubmitted, breakfastSubmitted, finalSubmi
 }
 
 /* ============================ TEACHER: CLASSROOM WORKSPACE ============================ */
-// Enforces the required 3-step order for every day: Lunch Pre-Count -> Breakfast Pre-Count (for the
-// next school day) -> Lunch Final Count. The lunch final count automatically carries over the
-// pre-count's entries until the teacher changes something, exactly like before; breakfast is its
-// own independent count each day, targeting whichever day is next on the school calendar.
+// Enforces the required step order for every day: Today's Lunch Count -> Breakfast Pre-Count (for
+// the next school day, skipped entirely for Staff & Adults classrooms) -> Today's Final Lunch
+// Count. The final count automatically carries over the pre-count's entries until the teacher
+// changes something, exactly like before; breakfast is its own independent count each day,
+// targeting whichever day is next on the school calendar.
 function ClassroomWorkspace({ data, classroomId, onBack }) {
   const cls = data.classrooms.find(c => c.id === classroomId);
+  const isStaff = !!(cls && cls.type === 'staff');
+  const showAdultCard = isStaff && !!(cls && cls.showAdultCard);
   const roster = data.students.filter(s => s.classroomId === classroomId);
   const today = todayStr();
   const todayLog = data.logsById[logId(today, classroomId)];
@@ -1809,7 +1939,7 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
   useEffect(() => {
     if (!todayLog) {
       saveLogFull(today, classroomId, {
-        pre: { entries: emptyEntries(roster), submitted: false, submittedAt: null },
+        pre: { entries: emptyEntries(roster), submitted: false, submittedAt: null, adultsCount: 0 },
         breakfast: { entries: emptyBreakfastEntries(roster), submitted: false, submittedAt: null, targetDate: breakfastTargetDate },
         // NOTE: final.entries starts as a truly empty {} — NOT emptyEntries(roster). If it were
         // pre-filled with generic default entries here, `hasOwnFinalEntries` below would see a
@@ -1838,13 +1968,16 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
   const hasOwnFinalEntries = todayLog && todayLog.final && todayLog.final.entries && Object.keys(todayLog.final.entries).length > 0;
   const finalEntries = hasOwnFinalEntries ? todayLog.final.entries : preEntries;
 
+  const preAdultsCount = (todayLog && todayLog.pre && todayLog.pre.adultsCount) || 0;
+  const finalAdultsCount = (todayLog && todayLog.final && typeof todayLog.final.adultsCount === 'number') ? todayLog.final.adultsCount : preAdultsCount;
+
   const preSubmitted = !!(todayLog && todayLog.pre && todayLog.pre.submitted);
   const breakfastSubmitted = !!(todayLog && todayLog.breakfast && todayLog.breakfast.submitted);
   const finalSubmitted = !!(todayLog && todayLog.final && todayLog.final.submitted);
 
   function emptyBase() {
     return {
-      pre: { entries: emptyEntries(roster), submitted: false, submittedAt: null },
+      pre: { entries: emptyEntries(roster), submitted: false, submittedAt: null, adultsCount: 0 },
       breakfast: { entries: emptyBreakfastEntries(roster), submitted: false, submittedAt: null, targetDate: breakfastTargetDate },
       // Same reasoning as the useEffect above: keep this {} so a fresh/never-touched Final Count
       // mirrors the Pre-Count instead of generic defaults.
@@ -1870,9 +2003,20 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
     }
   }
 
+  async function updateAdults(targetStage, count) {
+    if (locked) return;
+    const base = todayLog || emptyBase();
+    if (targetStage === 'pre') {
+      await saveLogFull(today, classroomId, { ...base, pre: { ...base.pre, adultsCount: count } });
+    } else {
+      const currentFinalEntries = (base.final && Object.keys(base.final.entries || {}).length) ? base.final.entries : preEntries;
+      await saveLogFull(today, classroomId, { ...base, final: { ...(base.final || {}), entries: currentFinalEntries, adultsCount: count } });
+    }
+  }
+
   async function submitPre() {
     const base = todayLog || emptyBase();
-    await saveLogFull(today, classroomId, { ...base, pre: { entries: preEntries, submitted: true, submittedAt: new Date().toISOString() } });
+    await saveLogFull(today, classroomId, { ...base, pre: { entries: preEntries, submitted: true, submittedAt: new Date().toISOString(), adultsCount: preAdultsCount } });
     setSuccessInfo({ stage: 'pre' });
   }
 
@@ -1884,7 +2028,7 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
 
   async function submitFinal() {
     const base = todayLog || emptyBase();
-    await saveLogFull(today, classroomId, { ...base, final: { entries: finalEntries, submitted: true, submittedAt: new Date().toISOString() } });
+    await saveLogFull(today, classroomId, { ...base, final: { entries: finalEntries, submitted: true, submittedAt: new Date().toISOString(), adultsCount: finalAdultsCount } });
     setSuccessInfo({ stage: 'final' });
   }
 
@@ -1894,19 +2038,26 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
     onBack();
   }
 
-  // After the Lunch Pre-Count is submitted, keep the teacher in this workspace and drop them
-  // straight into the Breakfast Pre-Count instead of sending them back Home.
+  // After Today's Lunch Count is submitted, keep the teacher in this workspace and drop them
+  // straight into the Breakfast Pre-Count instead of sending them back Home (skipped for staff
+  // classrooms, which go straight to Today's Final Lunch Count instead).
   function goToBreakfastFromSuccess() {
     setSuccessInfo(null);
     setReviewing(false);
     setStage('breakfast');
   }
+  function goToFinalFromSuccess() {
+    setSuccessInfo(null);
+    setReviewing(false);
+    setStage('final');
+  }
 
   const submitFns = { pre: submitPre, breakfast: submitBreakfast, final: submitFinal };
   const activeEntries = stage === 'pre' ? preEntries : stage === 'breakfast' ? breakfastEntries : finalEntries;
+  const activeAdultsCount = stage === 'final' ? finalAdultsCount : preAdultsCount;
   const totals = tallyEntries(activeEntries, roster, stage === 'breakfast' ? defaultBreakfastEntry : defaultEntry);
   const sortedRoster = sortStudents(roster, sortBy);
-  const stageLabels = { pre: 'Lunch Pre-Count', breakfast: 'Breakfast Pre-Count', final: 'Lunch Final Count' };
+  const stageLabels = { pre: "Today's Lunch Count", breakfast: 'Breakfast Pre-Count', final: "Today's Final Lunch Count" };
 
   return (
     <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8 lg:pl-40">
@@ -1915,6 +2066,7 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
       {showEntryModal && roster.length > 0 && (
         <ClassroomEntryModal
           cls={cls}
+          isStaff={isStaff}
           preSubmitted={preSubmitted}
           breakfastSubmitted={breakfastSubmitted}
           finalSubmitted={finalSubmitted}
@@ -1945,7 +2097,7 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
 
       {roster.length === 0 ? (
         <div className="bg-white rounded-2xl card-shadow p-8 text-center border border-primary-100">
-          <p className="text-primary-600 font-light">No students assigned to this classroom yet. Ask your admin to add students under Admin View &rarr; Students.</p>
+          <p className="text-primary-600 font-light">No {isStaff ? 'staff' : 'students'} assigned to this classroom yet. Ask your admin to add {isStaff ? 'staff' : 'students'} under Admin View &rarr; {isStaff ? 'Staff & Adults' : 'Students'}.</p>
         </div>
       ) : reviewing ? (
         <ReviewScreen
@@ -1957,6 +2109,9 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
           onChangeEntry={(studentId, entry) => updateEntry(stage, studentId, entry)}
           onEdit={() => setReviewing(false)}
           onSubmit={submitFns[stage]}
+          adultsCount={activeAdultsCount}
+          onChangeAdults={(count) => updateAdults(stage, count)}
+          showAdultCard={showAdultCard && stage !== 'breakfast'}
         />
       ) : (
         <React.Fragment>
@@ -1965,34 +2120,36 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
               onClick={() => setStage('pre')}
               className={"btn-touch px-5 py-2.5 rounded-xl font-semibold text-sm transition-fast border-2 " + (stage === 'pre' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
             >
-              1. Lunch Pre-Count {preSubmitted ? '✓' : ''}
+              1. Today's Lunch Count {preSubmitted ? '✓' : ''}
             </button>
+            {!isStaff && (
+              <button
+                onClick={() => { if (preSubmitted) setStage('breakfast'); }}
+                disabled={!preSubmitted}
+                title={!preSubmitted ? "Submit Today's Lunch Count first" : ''}
+                className={"btn-touch px-5 py-2.5 rounded-xl font-semibold text-sm transition-fast border-2 disabled:opacity-40 disabled:cursor-not-allowed " + (stage === 'breakfast' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
+              >
+                2. Breakfast Pre-Count {breakfastSubmitted ? '✓' : ''}{!preSubmitted ? ' 🔒' : ''}
+              </button>
+            )}
             <button
-              onClick={() => { if (preSubmitted) setStage('breakfast'); }}
-              disabled={!preSubmitted}
-              title={!preSubmitted ? 'Submit the Lunch Pre-Count first' : ''}
-              className={"btn-touch px-5 py-2.5 rounded-xl font-semibold text-sm transition-fast border-2 disabled:opacity-40 disabled:cursor-not-allowed " + (stage === 'breakfast' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
-            >
-              2. Breakfast Pre-Count {breakfastSubmitted ? '✓' : ''}{!preSubmitted ? ' 🔒' : ''}
-            </button>
-            <button
-              onClick={() => { if (breakfastSubmitted) setStage('final'); }}
-              disabled={!breakfastSubmitted}
-              title={!breakfastSubmitted ? 'Submit the Breakfast Pre-Count first' : ''}
+              onClick={() => { if (isStaff ? preSubmitted : breakfastSubmitted) setStage('final'); }}
+              disabled={isStaff ? !preSubmitted : !breakfastSubmitted}
+              title={(isStaff ? !preSubmitted : !breakfastSubmitted) ? (isStaff ? "Submit Today's Lunch Count first" : 'Submit the Breakfast Pre-Count first') : ''}
               className={"btn-touch px-5 py-2.5 rounded-xl font-semibold text-sm transition-fast border-2 disabled:opacity-40 disabled:cursor-not-allowed " + (stage === 'final' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
             >
-              3. Lunch Final Count {finalSubmitted ? '✓' : ''}{!breakfastSubmitted ? ' 🔒' : ''}
+              {isStaff ? '2' : '3'}. Today's Final Lunch Count {finalSubmitted ? '✓' : ''}{(isStaff ? !preSubmitted : !breakfastSubmitted) ? ' 🔒' : ''}
             </button>
           </div>
 
-          {!preSubmitted && stage === 'pre' && (
+          {!preSubmitted && stage === 'pre' && !isStaff && (
             <div className="mb-6 bg-primary-50 border border-primary-200 text-primary-700 rounded-xl p-4 text-sm font-medium">
-              Complete and submit the Lunch Pre-Count before the Breakfast Pre-Count unlocks.
+              Complete and submit Today's Lunch Count before the Breakfast Pre-Count unlocks.
             </div>
           )}
           {stage === 'pre' && preSubmitted && !locked && (
             <div className="mb-6 bg-amber-50 border border-amber-300 text-amber-800 rounded-xl p-4 text-sm font-medium">
-              The pre-count was already submitted for today. You can still make corrections and re-submit.
+              Today's Lunch Count was already submitted. You can still make corrections and re-submit.
             </div>
           )}
           {stage === 'breakfast' && (
@@ -2007,12 +2164,18 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
           )}
           {stage === 'final' && finalSubmitted && !locked && (
             <div className="mb-6 bg-amber-50 border border-amber-300 text-amber-800 rounded-xl p-4 text-sm font-medium">
-              The final count was already submitted. You can still switch any student's status and re-submit before it's verified by an admin.
+              Today's Final Lunch Count was already submitted. You can still switch any status and re-submit before it's verified by an admin.
             </div>
           )}
           {stage === 'final' && !hasOwnFinalEntries && (
             <div className="mb-6 bg-primary-50 border border-primary-200 text-primary-700 rounded-xl p-4 text-sm font-medium">
-              Starting from today's Lunch Pre-Count. Switch any student's meal, milk, or absence status below before submitting.
+              Starting from Today's Lunch Count. Switch any status below before submitting.
+            </div>
+          )}
+
+          {showAdultCard && stage !== 'breakfast' && (
+            <div className="mb-6">
+              <AdultsCounterCard count={activeAdultsCount} onChange={(count) => updateAdults(stage, count)} disabled={locked} />
             </div>
           )}
 
@@ -2054,10 +2217,10 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
         </React.Fragment>
       )}
 
-      {successInfo && successInfo.stage === 'pre' && (
+      {successInfo && successInfo.stage === 'pre' && !isStaff && (
         <SuccessModal
-          title="Pre-Count Submitted!"
-          message={'The Lunch Pre-Count has been saved. Next, take the Breakfast Pre-Count for ' + formatShortDate(breakfastTargetDate) + '.'}
+          title="Lunch Count Submitted!"
+          message={"Today's Lunch Count has been saved. Next, take the Breakfast Pre-Count for " + formatShortDate(breakfastTargetDate) + '.'}
         >
           <div className="flex flex-col gap-3">
             <button
@@ -2076,12 +2239,34 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
         </SuccessModal>
       )}
 
+      {successInfo && successInfo.stage === 'pre' && isStaff && (
+        <SuccessModal
+          title="Lunch Count Submitted!"
+          message="Today's Lunch Count has been saved. Next, take Today's Final Lunch Count."
+        >
+          <div className="flex flex-col gap-3">
+            <button
+              onClick={goToFinalFromSuccess}
+              className="btn-touch w-full px-5 py-3 rounded-xl bg-green-600 text-white font-semibold text-base transition-fast hover:bg-green-700 active:scale-[0.98]"
+            >
+              Take Today's Final Lunch Count Next &rarr;
+            </button>
+            <button
+              onClick={handleDone}
+              className="btn-touch w-full px-4 py-2.5 rounded-xl bg-gray-100 text-gray-400 font-medium text-sm border border-gray-200 hover:bg-gray-200 hover:text-gray-500 transition-fast"
+            >
+              Return Home
+            </button>
+          </div>
+        </SuccessModal>
+      )}
+
       {successInfo && successInfo.stage !== 'pre' && (
         <SuccessModal
           title={successInfo.stage === 'breakfast' ? 'Breakfast Pre-Count Submitted!' : 'Final Count Submitted!'}
           message={
-            successInfo.stage === 'breakfast' ? 'The Breakfast Pre-Count has been saved for ' + formatShortDate(breakfastTargetDate) + '. Next, complete the Lunch Final Count.' :
-            'The Lunch Final Count has been saved for today.'
+            successInfo.stage === 'breakfast' ? 'The Breakfast Pre-Count has been saved for ' + formatShortDate(breakfastTargetDate) + ". Next, complete Today's Final Lunch Count." :
+            "Today's Final Lunch Count has been saved for today."
           }
           onDone={handleDone}
         />
@@ -2094,15 +2279,17 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
 function LunchVerificationTab({ data }) {
   const [dateVal, setDateVal] = useState(todayStr());
   const [expanded, setExpanded] = useState({});
+  const [collapsed, setCollapsed] = useState({});
 
   function toggleExpand(id) { setExpanded(prev => ({ ...prev, [id]: !prev[id] })); }
+  function toggleCollapse(id) { setCollapsed(prev => ({ ...prev, [id]: !prev[id] })); }
 
   async function verifyClassroom(cls) {
     const log = data.logsById[logId(dateVal, cls.id)];
     const finalSubmitted = !!(log && log.final && log.final.submitted);
     if (!finalSubmitted) {
       const proceed = confirm(
-        'The Lunch Final Count for ' + classroomLabel(cls) + ' has not been submitted (or was not submitted properly) for ' +
+        "Today's Final Lunch Count for " + classroomLabel(cls) + ' has not been submitted (or was not submitted properly) for ' +
         formatDisplayDate(dateVal) + '.\n\nVerify and finalize it anyway?'
       );
       if (!proceed) return;
@@ -2133,7 +2320,7 @@ function LunchVerificationTab({ data }) {
     } else {
       const names = notSubmitted.map(classroomLabel).join(', ');
       const proceed = confirm(
-        'The following classroom(s) have not submitted (or did not submit properly) a Lunch Final Count for ' +
+        "The following classroom(s) have not submitted (or did not submit properly) Today's Final Lunch Count for " +
         formatDisplayDate(dateVal) + ':\n\n' + names +
         '\n\nClick Cancel to leave them unverified, or OK to verify and finalize ALL ' + unverified.length + ' classroom(s) anyway, including these.'
       );
@@ -2168,6 +2355,7 @@ function LunchVerificationTab({ data }) {
             const finalSubmitted = !!(log && log.final && log.final.submitted);
             const verified = !!(log && log.verified);
             const status = verified ? 'Verified' : (finalSubmitted ? 'Completed' : (preSubmitted ? 'In Progress' : 'Not Started'));
+            const isCollapsed = !!collapsed[cls.id];
 
             const changedStudents = finalSubmitted ? roster.filter(s => entryChanged(preEntries[s.id], finalEntries[s.id])) : [];
             const summaryDiffs = [];
@@ -2183,13 +2371,18 @@ function LunchVerificationTab({ data }) {
             return (
               <div key={cls.id} className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
                 <div className="flex justify-between items-start mb-4 flex-wrap gap-2">
-                  <div>
-                    <h4 className="font-bold text-primary-900">{classroomLabel(cls)}</h4>
-                    <p className="text-xs font-light text-primary-500">{roster.length} students{changedStudents.length > 0 ? ' \u00b7 ' + changedStudents.length + ' changed since morning' : ''}</p>
+                  <div onClick={() => toggleCollapse(cls.id)} className="flex items-center gap-3 text-left flex-1 min-w-0 cursor-pointer">
+                    <CollapseToggle collapsed={isCollapsed} onClick={() => toggleCollapse(cls.id)} />
+                    <div className="min-w-0">
+                      <h4 className="font-bold text-primary-900 truncate">{classroomLabel(cls)}</h4>
+                      <p className="text-xs font-light text-primary-500">{roster.length} students{changedStudents.length > 0 ? ' \u00b7 ' + changedStudents.length + ' changed since morning' : ''}</p>
+                    </div>
                   </div>
                   <Badge status={status} />
                 </div>
 
+                {!isCollapsed && (
+                <React.Fragment>
                 {verified ? (
                   <div className="bg-purple-50 border border-purple-200 rounded-xl p-4 mb-4">
                     <p className="text-xs font-semibold text-purple-700 uppercase mb-2">Verified Final Count</p>
@@ -2202,11 +2395,11 @@ function LunchVerificationTab({ data }) {
                 ) : (
                   <div className="grid sm:grid-cols-2 gap-4 mb-4">
                     <div className="bg-primary-50 rounded-xl p-3">
-                      <p className="text-xs font-semibold text-primary-700 uppercase mb-1">Lunch Pre-Count {preSubmitted ? '' : '(not submitted)'}</p>
+                      <p className="text-xs font-semibold text-primary-700 uppercase mb-1">Today's Lunch Count {preSubmitted ? '' : '(not submitted)'}</p>
                       <p className="text-sm text-primary-800">Hot {preT.hot} &middot; Sack {preT.sack} &middot; Absent {preT.absent} &middot; Milk {preT.milk}</p>
                     </div>
                     <div className="bg-primary-50 rounded-xl p-3">
-                      <p className="text-xs font-semibold text-primary-700 uppercase mb-1">Lunch Final Count {finalSubmitted ? '' : '(not submitted)'}</p>
+                      <p className="text-xs font-semibold text-primary-700 uppercase mb-1">Today's Final Lunch Count {finalSubmitted ? '' : '(not submitted)'}</p>
                       <p className="text-sm text-primary-800">Hot {finalT.hot} &middot; Sack {finalT.sack} &middot; Absent {finalT.absent} &middot; Milk {finalT.milk}</p>
                     </div>
                   </div>
@@ -2266,6 +2459,8 @@ function LunchVerificationTab({ data }) {
                     <PrimaryButton onClick={() => verifyClassroom(cls)}>Verify &amp; Finalize</PrimaryButton>
                   )}
                 </div>
+                </React.Fragment>
+                )}
               </div>
             );
           })}
@@ -2281,6 +2476,8 @@ function LunchVerificationTab({ data }) {
 // touches the other.
 function BreakfastVerificationTab({ data }) {
   const [dateVal, setDateVal] = useState(todayStr());
+  const [collapsed, setCollapsed] = useState({});
+  function toggleCollapse(id) { setCollapsed(prev => ({ ...prev, [id]: !prev[id] })); }
 
   function tallyBreakfastFinal(entries, roster) {
     let pickedUp = 0, noShow = 0, absent = 0;
@@ -2352,7 +2549,7 @@ function BreakfastVerificationTab({ data }) {
         <p className="text-sm font-light text-primary-500">No classrooms yet.</p>
       ) : (
         <div className="grid gap-4">
-          {sortClassroomsByGrade(data.classrooms).map(cls => {
+          {sortClassroomsByGrade(data.classrooms).filter(cls => cls.type !== 'staff').map(cls => {
             const roster = sortStudents(data.students.filter(s => s.classroomId === cls.id), 'number');
             const log = data.logsById[logId(dateVal, cls.id)];
             const bf = log && log.breakfastFinal;
@@ -2365,17 +2562,23 @@ function BreakfastVerificationTab({ data }) {
             const bfSubmitted = !!(bf && bf.submitted);
             const verified = !!(log && log.breakfastVerified);
             const status = verified ? 'Verified' : (bfSubmitted ? 'Completed' : 'Not Started');
+            const isCollapsed = !!collapsed[cls.id];
 
             return (
               <div key={cls.id} className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
                 <div className="flex justify-between items-start mb-4 flex-wrap gap-2">
-                  <div>
-                    <h4 className="font-bold text-primary-900">{classroomLabel(cls)}</h4>
-                    <p className="text-xs font-light text-primary-500">{bfRoster.length} student{bfRoster.length === 1 ? '' : 's'} requested breakfast for this day</p>
+                  <div onClick={() => toggleCollapse(cls.id)} className="flex items-center gap-3 text-left flex-1 min-w-0 cursor-pointer">
+                    <CollapseToggle collapsed={isCollapsed} onClick={() => toggleCollapse(cls.id)} />
+                    <div className="min-w-0">
+                      <h4 className="font-bold text-primary-900 truncate">{classroomLabel(cls)}</h4>
+                      <p className="text-xs font-light text-primary-500">{bfRoster.length} student{bfRoster.length === 1 ? '' : 's'} requested breakfast for this day</p>
+                    </div>
                   </div>
                   <Badge status={status} />
                 </div>
 
+                {!isCollapsed && (
+                <React.Fragment>
                 {bfSubmitted ? (
                   <div className={"rounded-xl p-4 mb-4 border " + (verified ? 'bg-purple-50 border-purple-200' : 'bg-primary-50 border-primary-100')}>
                     <p className={"text-xs font-semibold uppercase mb-2 " + (verified ? 'text-purple-700' : 'text-primary-700')}>Breakfast Verification</p>
@@ -2395,6 +2598,8 @@ function BreakfastVerificationTab({ data }) {
                     <PrimaryButton onClick={() => verifyClassroom(cls)}>Verify &amp; Finalize</PrimaryButton>
                   )}
                 </div>
+                </React.Fragment>
+                )}
               </div>
             );
           })}
@@ -2429,6 +2634,42 @@ function VerificationPanel({ data }) {
 }
 
 /* ============================ ADMIN: ANALYTICS ============================ */
+// "Today" snapshot cards: a live PreCount card (fills in as teachers work through Today's Lunch
+// Count, before anything is submitted or verified) and a Verified Count card (only shows numbers
+// for classroom-days an admin has actually verified). These sit above the date-range picker
+// since they're always about today, regardless of what range the rest of Analytics is showing.
+function TodaySnapshotCards({ data }) {
+  const pre = useMemo(() => computeTodayPreCountSnapshot(data), [data]);
+  const ver = useMemo(() => computeTodayVerifiedSnapshot(data), [data]);
+  return (
+    <div className="grid md:grid-cols-2 gap-4 mb-8">
+      <div className="bg-white rounded-2xl card-shadow border-2 border-amber-200 p-5">
+        <h4 className="font-bold text-primary-900 mb-1">Today's PreCount</h4>
+        <p className="text-xs font-light text-primary-500 mb-4">Live &mdash; fills in as teachers submit Today's Lunch Count, before Final Count / verification.</p>
+        <div className="grid grid-cols-3 gap-3 mb-3">
+          <StatCard label="Today's Hot Lunch" value={pre.hot} />
+          <StatCard label="Today's Sack Lunch" value={pre.sack} />
+          <StatCard label="Today's Absences" value={pre.absent} />
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <StatCard label="Hot Lunch Milk" value={pre.milkHot} />
+          <StatCard label="Sack Lunch Milk" value={pre.milkSack} />
+        </div>
+      </div>
+      <div className="bg-white rounded-2xl card-shadow border-2 border-purple-200 p-5">
+        <h4 className="font-bold text-primary-900 mb-1">Today's Verified Count</h4>
+        <p className="text-xs font-light text-primary-500 mb-4">Only populates once an admin verifies a classroom's Final Lunch Count for today.</p>
+        <div className="grid grid-cols-2 gap-3">
+          <StatCard label="Today's Final Hot Lunch" value={ver.hot} />
+          <StatCard label="Today's Final Sack Lunch" value={ver.sack} />
+          <StatCard label="Today's Absences" value={ver.absent} />
+          <StatCard label="Today's Milk Count" value={ver.milk} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AnalyticsDashboard({ data }) {
   const [range, setRange] = useState('daily');
   const [dateVal, setDateVal] = useState(todayStr());
@@ -2436,6 +2677,8 @@ function AnalyticsDashboard({ data }) {
   const [termKey, setTermKey] = useState('Q1');
   const [customStart, setCustomStart] = useState(todayStr());
   const [customEnd, setCustomEnd] = useState(todayStr());
+  const [collapsed, setCollapsed] = useState({});
+  function toggleCollapse(id) { setCollapsed(prev => ({ ...prev, [id]: !prev[id] })); }
 
   let startDate, endDate, periodLabel, rangeError = null;
 
@@ -2472,11 +2715,13 @@ function AnalyticsDashboard({ data }) {
     return { hot, sack, absent, milk };
   }, [agg]);
 
-  const sortedClassrooms = useMemo(() => sortClassroomsByGrade(data.classrooms), [data.classrooms]);
+  const sortedClassrooms = useMemo(() => sortClassroomsByGrade(data.classrooms.filter(c => c.type !== 'staff')), [data.classrooms]);
 
   return (
     <div>
       <h3 className="text-xl font-bold text-primary-900 mb-4">Analytics &amp; Reporting</h3>
+
+      <TodaySnapshotCards data={data} />
 
       <div className="flex flex-wrap gap-2 mb-4">
         {[['daily','Daily'],['weekly','Weekly'],['monthly','Monthly'],['quarter','This Quarter'],['semester','This Semester'],['custom','Custom Date Range']].map(([val,label]) => (
@@ -2529,16 +2774,20 @@ function AnalyticsDashboard({ data }) {
               {sortedClassrooms.map(c => {
                 const v = agg[c.id] || { hot: 0, sack: 0, absent: 0, milk: 0 };
                 const roster = sortStudents(data.students.filter(s => s.classroomId === c.id), 'number');
+                const isCollapsed = !!collapsed[c.id];
                 return (
                   <div key={c.id} className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
                     <div className="flex justify-between items-start mb-3 flex-wrap gap-2">
-                      <div>
-                        <h4 className="font-bold text-primary-900">{classroomLabel(c)}</h4>
-                        <p className="text-xs font-light text-primary-500">{roster.length} students</p>
+                      <div onClick={() => toggleCollapse(c.id)} className="flex items-center gap-3 text-left flex-1 min-w-0 cursor-pointer">
+                        <CollapseToggle collapsed={isCollapsed} onClick={() => toggleCollapse(c.id)} />
+                        <div className="min-w-0">
+                          <h4 className="font-bold text-primary-900 truncate">{classroomLabel(c)}</h4>
+                          <p className="text-xs font-light text-primary-500">{roster.length} students</p>
+                        </div>
                       </div>
                       <p className="text-sm text-primary-700 font-medium">Hot {v.hot} &middot; Sack {v.sack} &middot; Absent {v.absent} &middot; Milk {v.milk}</p>
                     </div>
-                    {roster.length > 0 && (
+                    {!isCollapsed && roster.length > 0 && (
                       <div className="border-t border-primary-50 pt-3 mt-2">
                         <p className="text-xs font-semibold text-primary-500 uppercase mb-2">Student Detail</p>
                         <div className="divide-y divide-primary-50">
@@ -2751,7 +3000,7 @@ function GradeBandsPanel({ data }) {
 
   const gradesInUse = useMemo(() => {
     const set = new Set();
-    data.classrooms.forEach(c => { if (c.grade) set.add(c.grade); });
+    data.classrooms.forEach(c => { if (c.grade && c.type !== 'staff') set.add(c.grade); });
     return Array.from(set).sort((a, b) => gradeSortRank(a) - gradeSortRank(b) || a.localeCompare(b, undefined, { numeric: true }));
   }, [data.classrooms]);
 
@@ -2798,10 +3047,11 @@ function GradeBandsPanel({ data }) {
 
 /* ============================ ADMIN: STUDENT MANAGEMENT ============================ */
 function StudentManagement({ data }) {
+  const nonStaffClassrooms = useMemo(() => data.classrooms.filter(c => c.type !== 'staff'), [data.classrooms]);
   const [newNumber, setNewNumber] = useState('');
   const [newFirst, setNewFirst] = useState('');
   const [newLast, setNewLast] = useState('');
-  const [newClass, setNewClass] = useState(data.classrooms[0] ? data.classrooms[0].id : '');
+  const [newClass, setNewClass] = useState(nonStaffClassrooms[0] ? nonStaffClassrooms[0].id : '');
   const [newLunchStatus, setNewLunchStatus] = useState('paid');
   const [editingId, setEditingId] = useState(null);
   const [editNumber, setEditNumber] = useState('');
@@ -2812,13 +3062,15 @@ function StudentManagement({ data }) {
   const [filterClassroom, setFilterClassroom] = useState('');
   const [sortBy, setSortBy] = useState('classroom');
   const [studentSortBy, setStudentSortBy] = useState('number');
+  const [collapsed, setCollapsed] = useState({});
+  function toggleCollapse(id) { setCollapsed(prev => ({ ...prev, [id]: !prev[id] })); }
 
   const [importRows, setImportRows] = useState(null);
   const [importBusy, setImportBusy] = useState(false);
   const fileInputRef = useRef(null);
 
   useEffect(() => {
-    if (!newClass && data.classrooms[0]) setNewClass(data.classrooms[0].id);
+    if (!newClass && nonStaffClassrooms[0]) setNewClass(nonStaffClassrooms[0].id);
     // eslint-disable-next-line
   }, [data.classrooms]);
 
@@ -2863,12 +3115,12 @@ function StudentManagement({ data }) {
   }
 
   const visibleClassrooms = useMemo(() => {
-    let list = data.classrooms.slice();
+    let list = nonStaffClassrooms.slice();
     if (filterClassroom) list = list.filter(c => c.id === filterClassroom);
     if (sortBy === 'classroom') list.sort((a,b) => classroomLabel(a).localeCompare(classroomLabel(b)));
     if (sortBy === 'grade') list = sortClassroomsByGrade(list);
     return list;
-  }, [data.classrooms, filterClassroom, sortBy]);
+  }, [nonStaffClassrooms, filterClassroom, sortBy]);
 
   function studentsFor(classroomId) {
     let list = data.students.filter(s => s.classroomId === classroomId);
@@ -2904,7 +3156,7 @@ function StudentManagement({ data }) {
           const firstName = String(r[firstIdx]).trim();
           const lastName = String(r[lastIdx]).trim();
           const classroomVal = String(r[classroomIdx]).trim().toLowerCase();
-          const match = data.classrooms.find(c => classroomLabel(c).trim().toLowerCase() === classroomVal);
+          const match = nonStaffClassrooms.find(c => classroomLabel(c).trim().toLowerCase() === classroomVal);
           const rawStatus = lunchStatusIdx !== -1 ? String(r[lunchStatusIdx]).trim().toLowerCase() : 'paid';
           const lunchStatus = (rawStatus === 'reduced' || rawStatus === 'free') ? rawStatus : 'paid';
           return { number, firstName, lastName, classroomText: String(r[classroomIdx]).trim(), classroomId: match ? match.id : null, lunchStatus };
@@ -2935,7 +3187,7 @@ function StudentManagement({ data }) {
     <div>
       <h3 className="text-xl font-bold text-primary-900 mb-4">Student Management</h3>
 
-      {data.classrooms.length === 0 ? (
+      {nonStaffClassrooms.length === 0 ? (
         <p className="text-sm font-light text-primary-500 mb-4">Add a classroom first before adding students.</p>
       ) : (
         <form onSubmit={addStudent} className="bg-white rounded-2xl card-shadow p-4 border border-primary-100 mb-4 flex flex-wrap gap-3 items-end">
@@ -2954,7 +3206,7 @@ function StudentManagement({ data }) {
           <div>
             <label className="text-xs font-medium text-primary-500 uppercase">Classroom</label>
             <select value={newClass} onChange={e => setNewClass(e.target.value)} className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary">
-              {sortClassroomsByGrade(data.classrooms).map(c => <option key={c.id} value={c.id}>{classroomLabel(c)}</option>)}
+              {sortClassroomsByGrade(nonStaffClassrooms).map(c => <option key={c.id} value={c.id}>{classroomLabel(c)}</option>)}
             </select>
           </div>
           <div>
@@ -3016,7 +3268,7 @@ function StudentManagement({ data }) {
           <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Filter by Classroom</label>
           <select value={filterClassroom} onChange={e => setFilterClassroom(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2">
             <option value="">All Classrooms</option>
-            {sortClassroomsByGrade(data.classrooms).map(c => <option key={c.id} value={c.id}>{classroomLabel(c)}</option>)}
+            {sortClassroomsByGrade(nonStaffClassrooms).map(c => <option key={c.id} value={c.id}>{classroomLabel(c)}</option>)}
           </select>
         </div>
         <div>
@@ -3041,11 +3293,14 @@ function StudentManagement({ data }) {
         {visibleClassrooms.map(c => {
           const students = studentsFor(c.id);
           if (search.trim() && students.length === 0) return null;
+          const isCollapsed = !!collapsed[c.id];
           return (
             <div key={c.id} className="bg-white rounded-2xl card-shadow border border-primary-100 overflow-hidden">
-              <div className="bg-primary-50 px-4 py-2.5 border-b border-primary-100">
-                <h4 className="font-bold text-primary-900 text-sm">{classroomLabel(c)}</h4>
+              <div onClick={() => toggleCollapse(c.id)} className="w-full bg-primary-50 px-4 py-2.5 border-b border-primary-100 flex items-center gap-3 text-left cursor-pointer">
+                <CollapseToggle collapsed={isCollapsed} onClick={() => toggleCollapse(c.id)} />
+                <h4 className="font-bold text-primary-900 text-sm flex-1">{classroomLabel(c)} <span className="font-light text-primary-500">({students.length})</span></h4>
               </div>
+              {!isCollapsed && (
               <div className="divide-y divide-primary-50">
                 {students.length === 0 && <p className="p-4 text-sm font-light text-primary-500">No students.</p>}
                 {students.map(s => (
@@ -3064,7 +3319,7 @@ function StudentManagement({ data }) {
                       onChange={e => moveStudent(s.id, e.target.value)}
                       className="border-2 border-primary-200 rounded-lg px-2 py-1 text-sm"
                     >
-                      {sortClassroomsByGrade(data.classrooms).map(cc => <option key={cc.id} value={cc.id}>{classroomLabel(cc)}</option>)}
+                      {sortClassroomsByGrade(nonStaffClassrooms).map(cc => <option key={cc.id} value={cc.id}>{classroomLabel(cc)}</option>)}
                     </select>
                     <div className="flex gap-1">
                       {[['paid','Paid','bg-primary-50 text-primary border-primary-200'],['reduced','Reduced','bg-amber-50 text-amber-700 border-amber-300'],['free','Free','bg-green-50 text-green-700 border-green-300']].map(([val,label,activeClass]) => {
@@ -3089,6 +3344,7 @@ function StudentManagement({ data }) {
                   </div>
                 ))}
               </div>
+              )}
             </div>
           );
         })}
@@ -3097,17 +3353,152 @@ function StudentManagement({ data }) {
   );
 }
 
+/* ============================ ADMIN: STAFF & ADULTS MANAGEMENT ============================ */
+// Mirrors StudentManagement, but scoped to classrooms of type 'staff' only. Staff members are
+// stored in the same 'students' collection (they're just the "roster" of a Staff & Adults
+// classroom) so all of the existing entry-taking / verification / tallying logic works for them
+// without any changes. Lunch status (paid/reduced/free) isn't relevant for staff, so it's left
+// out here and always saved as 'paid'.
+function StaffManagement({ data }) {
+  const staffClassrooms = useMemo(() => sortClassroomsByGrade(data.classrooms.filter(c => c.type === 'staff')), [data.classrooms]);
+  const [newNumber, setNewNumber] = useState('');
+  const [newFirst, setNewFirst] = useState('');
+  const [newLast, setNewLast] = useState('');
+  const [newClass, setNewClass] = useState(staffClassrooms[0] ? staffClassrooms[0].id : '');
+  const [editingId, setEditingId] = useState(null);
+  const [editNumber, setEditNumber] = useState('');
+  const [editFirst, setEditFirst] = useState('');
+  const [editLast, setEditLast] = useState('');
+  const [collapsed, setCollapsed] = useState({});
+  function toggleCollapse(id) { setCollapsed(prev => ({ ...prev, [id]: !prev[id] })); }
+
+  useEffect(() => {
+    if (!newClass && staffClassrooms[0]) setNewClass(staffClassrooms[0].id);
+    // eslint-disable-next-line
+  }, [data.classrooms]);
+
+  async function addStaff(e) {
+    e.preventDefault();
+    if (!newFirst.trim() || !newLast.trim() || !newClass) return;
+    await saveStudent({ number: newNumber.trim() || '', firstName: newFirst.trim(), lastName: newLast.trim(), classroomId: newClass, lunchStatus: 'paid' });
+    setNewNumber(''); setNewFirst(''); setNewLast('');
+  }
+
+  async function deleteStaff(id) {
+    if (!confirm('Remove this staff member? This cannot be undone.')) return;
+    await deleteStudentDoc(id);
+  }
+
+  async function toggleParentCard(cls) {
+    await saveClassroom({ id: cls.id, grade: cls.grade, teacher: cls.teacher, type: 'staff', showAdultCard: !cls.showAdultCard });
+  }
+
+  function startEdit(s) { setEditingId(s.id); setEditNumber(String(s.number || '')); setEditFirst(s.firstName); setEditLast(s.lastName); }
+  async function saveEdit(id) {
+    const s = data.students.find(x => x.id === id);
+    if (!s) return;
+    await saveStudent({ id, number: editNumber.trim() || s.number, firstName: editFirst.trim() || s.firstName, lastName: editLast.trim() || s.lastName, classroomId: s.classroomId, lunchStatus: 'paid' });
+    setEditingId(null);
+  }
+
+  return (
+    <div>
+      <h3 className="text-xl font-bold text-primary-900 mb-4">Staff &amp; Adults</h3>
+      <p className="text-sm font-light text-primary-600 mb-4">
+        Manage the roster of staff who need lunch each day. Create a "Staff &amp; Adults" classroom
+        under Admin &rarr; Classrooms first, then add staff here &mdash; it works just like Student
+        Management, but only Today's Lunch Count and Today's Final Lunch Count apply (no breakfast).
+      </p>
+
+      {staffClassrooms.length === 0 ? (
+        <p className="text-sm font-light text-primary-500 mb-4">No "Staff &amp; Adults" classroom yet. Create one under Admin &rarr; Classrooms (choose Type: Staff &amp; Adults).</p>
+      ) : (
+        <React.Fragment>
+          <form onSubmit={addStaff} className="bg-white rounded-2xl card-shadow p-4 border border-primary-100 mb-6 flex flex-wrap gap-3 items-end">
+            <div className="w-24">
+              <label className="text-xs font-medium text-primary-500 uppercase">Staff # (optional)</label>
+              <input value={newNumber} onChange={e => setNewNumber(e.target.value)} placeholder="#" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary" />
+            </div>
+            <div className="flex-1 min-w-[140px]">
+              <label className="text-xs font-medium text-primary-500 uppercase">First Name</label>
+              <input value={newFirst} onChange={e => setNewFirst(e.target.value)} placeholder="First" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary" />
+            </div>
+            <div className="flex-1 min-w-[140px]">
+              <label className="text-xs font-medium text-primary-500 uppercase">Last Name</label>
+              <input value={newLast} onChange={e => setNewLast(e.target.value)} placeholder="Last" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary" />
+            </div>
+            <div>
+              <label className="text-xs font-medium text-primary-500 uppercase">Staff Classroom</label>
+              <select value={newClass} onChange={e => setNewClass(e.target.value)} className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary">
+                {staffClassrooms.map(c => <option key={c.id} value={c.id}>{classroomLabel(c)}</option>)}
+              </select>
+            </div>
+            <PrimaryButton type="submit">Add Staff Member</PrimaryButton>
+          </form>
+
+          <div className="grid gap-5">
+            {staffClassrooms.map(c => {
+              const roster = sortStudents(data.students.filter(s => s.classroomId === c.id), 'number');
+              const isCollapsed = !!collapsed[c.id];
+              return (
+                <div key={c.id} className="bg-white rounded-2xl card-shadow border border-primary-100 overflow-hidden">
+                  <div className="w-full bg-primary-50 px-4 py-2.5 border-b border-primary-100 flex items-center gap-3">
+                    <div onClick={() => toggleCollapse(c.id)} className="flex items-center gap-3 text-left flex-1 min-w-0 cursor-pointer">
+                      <CollapseToggle collapsed={isCollapsed} onClick={() => toggleCollapse(c.id)} />
+                      <h4 className="font-bold text-primary-900 text-sm">{classroomLabel(c)} <span className="font-light text-primary-500">({roster.length})</span></h4>
+                    </div>
+                    <label className="flex items-center gap-2 text-xs font-semibold text-primary-700 pr-1">
+                      <input type="checkbox" checked={!!c.showAdultCard} onChange={() => toggleParentCard(c)} />
+                      Enable Parent/Adult Card
+                    </label>
+                  </div>
+                  {!isCollapsed && (
+                  <div className="divide-y divide-primary-50">
+                    {roster.length === 0 && <p className="p-4 text-sm font-light text-primary-500">No staff added yet.</p>}
+                    {roster.map(s => (
+                      <div key={s.id} className="flex items-center gap-3 p-4 flex-wrap">
+                        {editingId === s.id ? (
+                          <React.Fragment>
+                            <input value={editNumber} onChange={e => setEditNumber(e.target.value)} className="border-2 border-primary-200 rounded-lg px-2 py-1 w-20" placeholder="#" autoFocus />
+                            <input value={editFirst} onChange={e => setEditFirst(e.target.value)} className="border-2 border-primary-200 rounded-lg px-2 py-1 flex-1 min-w-[110px]" placeholder="First" />
+                            <input value={editLast} onChange={e => setEditLast(e.target.value)} className="border-2 border-primary-200 rounded-lg px-2 py-1 flex-1 min-w-[110px]" placeholder="Last" />
+                          </React.Fragment>
+                        ) : (
+                          <p className="font-medium text-primary-900 flex-1 min-w-[140px]">{s.number ? <span className="text-primary-400">#{s.number} </span> : null}{s.firstName} {s.lastName}</p>
+                        )}
+                        {editingId === s.id ? (
+                          <button onClick={() => saveEdit(s.id)} className="px-3 py-1.5 rounded-lg bg-primary text-white text-sm font-semibold">Save</button>
+                        ) : (
+                          <button onClick={() => startEdit(s)} className="px-3 py-1.5 rounded-lg bg-primary-50 text-primary text-sm font-semibold hover:bg-primary-100">Edit</button>
+                        )}
+                        <button onClick={() => deleteStaff(s.id)} className="px-3 py-1.5 rounded-lg bg-rose-50 text-rose-600 text-sm font-semibold hover:bg-rose-100">Delete</button>
+                      </div>
+                    ))}
+                  </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </React.Fragment>
+      )}
+    </div>
+  );
+}
+
 /* ============================ ADMIN: CLASSROOM MANAGEMENT ============================ */
 function ClassroomManagement({ data }) {
-  const [form, setForm] = useState({ grade: '', teacher: '' });
+  const [form, setForm] = useState({ grade: '', teacher: '', type: 'class', showAdultCard: false });
   const [editingId, setEditingId] = useState(null);
-  const [editForm, setEditForm] = useState({ grade: '', teacher: '' });
+  const [editForm, setEditForm] = useState({ grade: '', teacher: '', type: 'class', showAdultCard: false });
+  const [collapsed, setCollapsed] = useState({});
+  function toggleCollapse(id) { setCollapsed(prev => ({ ...prev, [id]: !prev[id] })); }
 
   async function addClassroom(e) {
     e.preventDefault();
     if (!form.grade.trim() || !form.teacher.trim()) return;
-    await saveClassroom({ grade: form.grade.trim(), teacher: form.teacher.trim() });
-    setForm({ grade: '', teacher: '' });
+    await saveClassroom({ grade: form.grade.trim(), teacher: form.teacher.trim(), type: form.type, showAdultCard: form.type === 'staff' && form.showAdultCard });
+    setForm({ grade: '', teacher: '', type: 'class', showAdultCard: false });
   }
 
   async function deleteClassroom(id) {
@@ -3117,25 +3508,38 @@ function ClassroomManagement({ data }) {
     await deleteClassroomDoc(id);
   }
 
-  function startEdit(c) { setEditingId(c.id); setEditForm({ grade: c.grade, teacher: c.teacher }); }
+  function startEdit(c) { setEditingId(c.id); setEditForm({ grade: c.grade, teacher: c.teacher, type: c.type || 'class', showAdultCard: !!c.showAdultCard }); }
   async function saveEdit(id) {
-    await saveClassroom({ id, grade: editForm.grade.trim(), teacher: editForm.teacher.trim() });
+    await saveClassroom({ id, grade: editForm.grade.trim(), teacher: editForm.teacher.trim(), type: editForm.type, showAdultCard: editForm.type === 'staff' && editForm.showAdultCard });
     setEditingId(null);
   }
 
   return (
     <div>
       <h3 className="text-xl font-bold text-primary-900 mb-4">Classroom Management</h3>
-      <p className="text-sm font-light text-primary-600 mb-4">Classrooms are identified by grade and teacher only.</p>
+      <p className="text-sm font-light text-primary-600 mb-4">Classrooms are identified by grade and teacher. Choose Type: "Staff &amp; Adults" for a classroom that tracks staff/adult lunches instead of a student roster (Today's Lunch Count and Today's Final Lunch Count only &mdash; no breakfast).</p>
       <form onSubmit={addClassroom} className="bg-white rounded-2xl card-shadow p-4 border border-primary-100 mb-6 flex flex-wrap gap-3 items-end">
         <div>
-          <label className="text-xs font-medium text-primary-500 uppercase">Grade</label>
-          <input value={form.grade} onChange={e => setForm({ ...form, grade: e.target.value })} placeholder="2nd Grade" className="border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 w-40 focus:outline-none focus:border-primary" />
+          <label className="text-xs font-medium text-primary-500 uppercase">Grade / Name</label>
+          <input value={form.grade} onChange={e => setForm({ ...form, grade: e.target.value })} placeholder={form.type === 'staff' ? 'Staff & Adults' : '2nd Grade'} className="border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 w-40 focus:outline-none focus:border-primary" />
         </div>
         <div>
-          <label className="text-xs font-medium text-primary-500 uppercase">Teacher</label>
+          <label className="text-xs font-medium text-primary-500 uppercase">Teacher / Contact</label>
           <input value={form.teacher} onChange={e => setForm({ ...form, teacher: e.target.value })} placeholder="Mrs. Smith" className="border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 w-48 focus:outline-none focus:border-primary" />
         </div>
+        <div>
+          <label className="text-xs font-medium text-primary-500 uppercase">Type</label>
+          <select value={form.type} onChange={e => setForm({ ...form, type: e.target.value })} className="border-2 border-primary-200 rounded-xl px-3 py-2 mt-1">
+            <option value="class">Classroom</option>
+            <option value="staff">Staff &amp; Adults</option>
+          </select>
+        </div>
+        {form.type === 'staff' && (
+          <label className="flex items-center gap-2 text-sm font-medium text-primary-700 pb-2">
+            <input type="checkbox" checked={form.showAdultCard} onChange={e => setForm({ ...form, showAdultCard: e.target.checked })} />
+            Enable Parent/Adult Card
+          </label>
+        )}
         <PrimaryButton type="submit">Add Classroom</PrimaryButton>
       </form>
 
@@ -3147,21 +3551,40 @@ function ClassroomManagement({ data }) {
               <div className="flex flex-col gap-2">
                 <input value={editForm.grade} onChange={e => setEditForm({ ...editForm, grade: e.target.value })} className="border-2 border-primary-200 rounded-lg px-2 py-1" placeholder="Grade" />
                 <input value={editForm.teacher} onChange={e => setEditForm({ ...editForm, teacher: e.target.value })} className="border-2 border-primary-200 rounded-lg px-2 py-1" placeholder="Teacher" />
+                <select value={editForm.type} onChange={e => setEditForm({ ...editForm, type: e.target.value })} className="border-2 border-primary-200 rounded-lg px-2 py-1">
+                  <option value="class">Classroom</option>
+                  <option value="staff">Staff &amp; Adults</option>
+                </select>
+                {editForm.type === 'staff' && (
+                  <label className="flex items-center gap-2 text-sm font-medium text-primary-700">
+                    <input type="checkbox" checked={editForm.showAdultCard} onChange={e => setEditForm({ ...editForm, showAdultCard: e.target.checked })} />
+                    Enable Parent/Adult Card
+                  </label>
+                )}
                 <div className="flex gap-2 mt-1">
                   <button onClick={() => saveEdit(c.id)} className="px-3 py-1.5 rounded-lg bg-primary text-white text-sm font-semibold">Save</button>
                   <button onClick={() => setEditingId(null)} className="px-3 py-1.5 rounded-lg bg-gray-100 text-gray-600 text-sm font-semibold">Cancel</button>
                 </div>
               </div>
             ) : (
-              <div className="flex justify-between items-center flex-wrap gap-2">
-                <div>
-                  <p className="font-bold text-primary-900">{c.grade}</p>
-                  <p className="text-sm text-primary-600 font-light">{c.teacher}</p>
-                  <p className="text-xs text-primary-400 font-light mt-1">{data.students.filter(s => s.classroomId === c.id).length} students</p>
-                </div>
-                <div className="flex gap-2">
-                  <button onClick={() => startEdit(c)} className="px-3 py-1.5 rounded-lg bg-primary-50 text-primary text-sm font-semibold hover:bg-primary-100">Edit</button>
-                  <button onClick={() => deleteClassroom(c.id)} className="px-3 py-1.5 rounded-lg bg-rose-50 text-rose-600 text-sm font-semibold hover:bg-rose-100">Delete</button>
+              <div>
+                <div className="flex justify-between items-start flex-wrap gap-2">
+                  <div onClick={() => toggleCollapse(c.id)} className="flex items-center gap-3 text-left flex-1 min-w-0 cursor-pointer">
+                    <CollapseToggle collapsed={!!collapsed[c.id]} onClick={() => toggleCollapse(c.id)} />
+                    <div>
+                      <p className="font-bold text-primary-900">{c.grade}{c.type === 'staff' && ' 🧑‍🏫'}</p>
+                      {!collapsed[c.id] && (
+                        <React.Fragment>
+                          <p className="text-sm text-primary-600 font-light">{c.teacher}</p>
+                          <p className="text-xs text-primary-400 font-light mt-1">{data.students.filter(s => s.classroomId === c.id).length} {c.type === 'staff' ? 'staff' : 'students'}{c.type === 'staff' && c.showAdultCard ? ' \u00b7 Adult card enabled' : ''}</p>
+                        </React.Fragment>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    <button onClick={() => startEdit(c)} className="px-3 py-1.5 rounded-lg bg-primary-50 text-primary text-sm font-semibold hover:bg-primary-100">Edit</button>
+                    <button onClick={() => deleteClassroom(c.id)} className="px-3 py-1.5 rounded-lg bg-rose-50 text-rose-600 text-sm font-semibold hover:bg-rose-100">Delete</button>
+                  </div>
                 </div>
               </div>
             )}
@@ -3199,7 +3622,7 @@ function ExportPanel({ data }) {
       alert(
         'Export blocked: ' + unverifiedDays.length + ' classroom-day' + (unverifiedDays.length === 1 ? '' : 's') +
         ' in ' + monthNameOf(month) + ' ' + year + ' ' + (unverifiedDays.length === 1 ? 'has' : 'have') +
-        ' a submitted Lunch Final Count that has not been verified by an admin yet. See the list below \u2014 verify ' +
+        " a submitted Final Lunch Count that has not been verified by an admin yet. See the list below \u2014 verify " +
         (unverifiedDays.length === 1 ? 'it' : 'them') + ' in Admin \u2192 Daily Verification & Finalization (Lunch tab) first.'
       );
       return;
@@ -3218,13 +3641,13 @@ function ExportPanel({ data }) {
         your official monthly form &mdash; Elementary / Middle / High School Paid, Reduced Price, Free,
         and Total, one row per day, with the same live formulas. This always reflects the current
         saved data, so anything deleted or corrected in Admin &rarr; Data Management is already
-        accounted for before you download.
+        accounted for before you download. Staff &amp; Adults classrooms are excluded from this report.
       </p>
 
       {unverifiedDays.length > 0 && (
         <div className="mb-4 bg-rose-50 border-2 border-rose-300 text-rose-800 rounded-xl p-4">
           <p className="text-sm font-bold mb-2">
-            ⚠ Export blocked &mdash; {unverifiedDays.length} unverified Lunch Final Count{unverifiedDays.length === 1 ? '' : 's'} in {monthNameOf(month)} {year}:
+            ⚠ Export blocked &mdash; {unverifiedDays.length} unverified Final Lunch Count{unverifiedDays.length === 1 ? '' : 's'} in {monthNameOf(month)} {year}:
           </p>
           <ul className="text-sm font-light list-disc list-inside max-h-40 overflow-y-auto">
             {unverifiedDays.map((p, i) => (
@@ -3351,7 +3774,7 @@ function DataManagementPanel({ data }) {
   async function runDelete() {
     if (!preview || preview.matches.length === 0) return;
     const verifiedCount = preview.matches.filter(l => l.verified).length;
-    const whatMap = { both: "the entire day's record", pre: 'the lunch pre-count', breakfast: 'the breakfast pre-count', final: 'the lunch final count' };
+    const whatMap = { both: "the entire day's record", pre: "today's lunch count", breakfast: 'the breakfast pre-count', final: "today's final lunch count" };
     const what = whatMap[target];
     const msg = 'This will permanently delete ' + what + ' for ' + preview.matches.length +
       ' classroom-day record(s) in ' + preview.range.label +
@@ -3417,9 +3840,9 @@ function DataManagementPanel({ data }) {
           <label className="text-xs font-medium text-primary-500 uppercase block mb-1">What to Remove</label>
           <select value={target} onChange={e => { setTarget(e.target.value); resetPreview(); }} className="border-2 border-primary-200 rounded-xl px-3 py-2">
             <option value="both">Both (delete entire day's record)</option>
-            <option value="pre">Lunch Pre-Count only</option>
+            <option value="pre">Today's Lunch Count only</option>
             <option value="breakfast">Breakfast Pre-Count only</option>
-            <option value="final">Lunch Final Count only</option>
+            <option value="final">Today's Final Lunch Count only</option>
           </select>
         </div>
         <label className="flex items-center gap-2 text-sm text-primary-700 font-medium pb-2">
@@ -3518,7 +3941,7 @@ function StudentRecordEditor({ data }) {
 
   async function clearEntry(stageKey) {
     if (!log) return;
-    const labelMap = { pre: 'lunch pre-count', breakfast: 'breakfast pre-count', final: 'lunch final count' };
+    const labelMap = { pre: "today's lunch count", breakfast: 'breakfast pre-count', final: "today's final lunch count" };
     if (!confirm("Remove this student's " + labelMap[stageKey] + ' entry for this day?')) return;
     setBusy(true);
     await clearStudentFromLogs([log], studentId, stageKey);
@@ -3553,13 +3976,14 @@ function StudentRecordEditor({ data }) {
   }
 
   const breakfastTargetLabel = log && log.breakfast && log.breakfast.targetDate ? formatShortDate(log.breakfast.targetDate) : formatShortDate(nextSchoolDay(data.settings, dateVal));
+  const isStaffClassroom = (data.classrooms.find(c => c.id === classroomId) || {}).type === 'staff';
 
   return (
     <div>
       <h3 className="text-xl font-bold text-primary-900 mb-4">Edit or Remove One Student's Record</h3>
       <p className="text-sm font-light text-primary-600 mb-4">
         Fix a mistake for a single student on a single day without touching anyone else's counts.
-        Editing the lunch final count automatically un-verifies that day, so it's clear the
+        Editing the final count automatically un-verifies that day, so it's clear the
         finalized number changed.
       </p>
       <div className="flex flex-wrap gap-4 items-end mb-4">
@@ -3586,10 +4010,10 @@ function StudentRecordEditor({ data }) {
       ) : !studentId ? (
         <p className="text-sm font-light text-primary-500">This classroom has no students yet.</p>
       ) : (
-        <div className="grid sm:grid-cols-3 gap-4">
-          <EntryEditor label="Lunch Pre-Count" entry={preEntry} stageKey="pre" kind="lunch" />
-          <EntryEditor label={"Breakfast Pre-Count (for " + breakfastTargetLabel + ")"} entry={breakfastEntry} stageKey="breakfast" kind="breakfast" />
-          <EntryEditor label="Lunch Final Count" entry={finalEntry} stageKey="final" kind="lunch" />
+        <div className={"grid gap-4 " + (isStaffClassroom ? 'sm:grid-cols-2' : 'sm:grid-cols-3')}>
+          <EntryEditor label="Today's Lunch Count" entry={preEntry} stageKey="pre" kind="lunch" />
+          {!isStaffClassroom && <EntryEditor label={"Breakfast Pre-Count (for " + breakfastTargetLabel + ")"} entry={breakfastEntry} stageKey="breakfast" kind="breakfast" />}
+          <EntryEditor label="Today's Final Lunch Count" entry={finalEntry} stageKey="final" kind="lunch" />
         </div>
       )}
       {busy && <p className="text-xs text-primary-400 mt-2">Saving…</p>}
@@ -3700,6 +4124,7 @@ function AdminPanel({ data, authUser, onLogout }) {
     ['verification', 'Verification'],
     ['classrooms', 'Classrooms'],
     ['students', 'Students'],
+    ['staff', 'Staff & Adults'],
     ['gradebands', 'Grade Bands'],
     ['settings', 'Term Settings'],
     ['export', 'Export'],
@@ -3729,6 +4154,7 @@ function AdminPanel({ data, authUser, onLogout }) {
       {tab === 'verification' && <VerificationPanel data={data} />}
       {tab === 'classrooms' && <ClassroomManagement data={data} />}
       {tab === 'students' && <StudentManagement data={data} />}
+      {tab === 'staff' && <StaffManagement data={data} />}
       {tab === 'gradebands' && <GradeBandsPanel data={data} />}
       {tab === 'settings' && <TermSettingsPanel settings={data.settings} />}
       {tab === 'export' && <ExportPanel data={data} />}
