@@ -197,6 +197,25 @@ function formatShortDate(dateStr) {
 }
 function uid(prefix) { return prefix + '_' + Math.random().toString(36).slice(2,9); }
 function classroomLabel(cls) { return cls ? (cls.grade + ' — ' + cls.teacher) : 'Unknown Classroom'; }
+// Whether each stage is enabled for a classroom. Missing/undefined fields default to true (an
+// older classroom doc created before this feature existed behaves exactly as before). Admins can
+// flip these off per classroom under Admin -> Classrooms.
+function stageEnabled(cls, stage) {
+  if (!cls) return true;
+  const key = stage === 'pre' ? 'enablePre' : stage === 'breakfast' ? 'enableBreakfast' : 'enableFinal';
+  return cls[key] !== false;
+}
+// The ordered list of stages actually offered for a classroom: Breakfast Pre-Count never applies
+// to Staff & Adults classrooms, and any stage an admin has disabled is skipped entirely (not just
+// locked) — including from the "you must submit X first" gating for the stages that remain.
+function activeStages(cls) {
+  const isStaff = !!(cls && cls.type === 'staff');
+  const stages = [];
+  if (stageEnabled(cls, 'pre')) stages.push('pre');
+  if (!isStaff && stageEnabled(cls, 'breakfast')) stages.push('breakfast');
+  if (stageEnabled(cls, 'final')) stages.push('final');
+  return stages;
+}
 const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 function monthNameOf(m) { return MONTH_NAMES[m - 1] || ''; }
 function daysInMonth(year, month) { return new Date(year, month, 0).getDate(); }
@@ -265,6 +284,23 @@ function tallyEntriesSplitMilk(entries, roster, defaultEntryFn) {
     else if (e.meal === 'sack') { sack++; if (e.milk === 'yes') milkSack++; }
   });
   return { hot, sack, absent, milkHot, milkSack, total: roster.length };
+}
+// "Staff & Adults" classrooms use a much simpler per-person entry than students: just whether
+// that staff member is eating lunch today (yes/no), defaulting to "no" so the teacher/admin only
+// needs to flip on the people who ARE eating. No absent/sack/hot/milk options apply to staff.
+function defaultStaffEntry() { return { attending: false }; }
+function emptyStaffEntries(roster) {
+  const e = {};
+  roster.forEach(s => { e[s.id] = defaultStaffEntry(); });
+  return e;
+}
+function tallyStaffEntries(entries, roster) {
+  let yes = 0, no = 0;
+  roster.forEach(s => {
+    const e = (entries && entries[s.id]) || defaultStaffEntry();
+    if (e.attending) yes++; else no++;
+  });
+  return { yes, no, total: roster.length };
 }
 function entryChanged(preE, finalE) {
   const a = preE || defaultEntry(), b = finalE || defaultEntry();
@@ -466,7 +502,10 @@ async function saveClassroom(cls) {
     grade: cls.grade,
     teacher: cls.teacher,
     type: cls.type || 'class',
-    showAdultCard: !!cls.showAdultCard
+    showAdultCard: !!cls.showAdultCard,
+    enablePre: cls.enablePre !== false,
+    enableBreakfast: cls.enableBreakfast !== false,
+    enableFinal: cls.enableFinal !== false
   });
   return id;
 }
@@ -711,6 +750,24 @@ function computeTodayVerifiedSnapshot(data) {
     hot += t.hot; sack += t.sack; absent += t.absent; milk += t.milk;
   });
   return { hot, sack, absent, milk };
+}
+
+// Live snapshot of today's Staff & Adults lunch counts, for the admin "Today's PreCount" card.
+// Mirrors computeTodayPreCountSnapshot above but reads the staff Yes/No entries plus each
+// classroom's separate adults/parents counter, since those are a different shape of data.
+function computeTodayStaffAdultSnapshot(data) {
+  const today = todayStr();
+  let staffLunch = 0, adultLunch = 0;
+  data.classrooms.forEach(cls => {
+    if (cls.type !== 'staff') return;
+    const roster = data.students.filter(s => s.classroomId === cls.id);
+    const log = data.logsById[logId(today, cls.id)];
+    const entries = (log && log.pre && log.pre.entries) || {};
+    const t = tallyStaffEntries(entries, roster);
+    staffLunch += t.yes;
+    if (cls.showAdultCard) adultLunch += (log && log.pre && log.pre.adultsCount) || 0;
+  });
+  return { staffLunch, adultLunch };
 }
 
 /* ============================ MONTHLY MEAL COUNT EXPORT (matches official template) ============================ */
@@ -981,7 +1038,18 @@ function CollapseToggle({ collapsed, onClick, label }) {
   );
 }
 
-function FloatingSummary({ totals, hideMilk }) {
+// isStaff switches this to the simplified Staff & Adults summary: just Staff count (how many
+// staff are marked "Yes" for lunch) and Adult count (the separate adults/parents counter, when
+// that card is enabled for this classroom) — no hot/sack/absent/milk breakdown applies to staff.
+function FloatingSummary({ totals, hideMilk, isStaff, staffCount, adultsCount }) {
+  if (isStaff) {
+    return (
+      <div className="hidden lg:flex flex-col gap-2 fixed left-4 top-28 z-30 bg-white rounded-2xl card-shadow-lg border border-primary-100 p-4 w-36">
+        <p className="font-bold text-primary-900 text-sm leading-tight">Staff count: {staffCount || 0}</p>
+        {adultsCount != null && <p className="font-bold text-primary-900 text-sm leading-tight">Adult count: {adultsCount || 0}</p>}
+      </div>
+    );
+  }
   return (
     <div className="hidden lg:flex flex-col gap-2 fixed left-4 top-28 z-30 bg-white rounded-2xl card-shadow-lg border border-primary-100 p-4 w-36">
       <p className="font-bold text-primary-900 text-sm leading-tight">Hot: {totals.hot}</p>
@@ -1605,9 +1673,37 @@ function BreakfastFinalView({ data, onBack }) {
 //     list can tell status at a glance — warm orange for Hot Lunch, blueish for Sack Lunch, and
 //     greyed-out for Absent with a distinct red "Undo Absent" box in the card's top-right corner.
 //  - 'lunch' (default, used for the Lunch Pre-Count): the original neutral white/grey styling.
-function StudentEntryCard({ student, entry, onChange, disabled, kind }) {
+// Staff & Adults classrooms use a plain Yes/No card: is this staff member eating lunch today?
+// No absent option, no hot/sack choice, no milk choice — just attending or not, default No.
+function StaffEntryCard({ student, entry, onChange, disabled }) {
+  const e = entry || defaultStaffEntry();
+  function set(attending) { if (!disabled) onChange({ attending }); }
+  return (
+    <div className={"relative rounded-2xl card-shadow p-4 border flex items-center justify-between gap-3 transition-fast " + (e.attending ? 'bg-green-50 border-green-300' : 'bg-white border-primary-100')}>
+      <p className="font-semibold text-primary-900 truncate">
+        <span className="text-primary-400 font-medium">#{student.number}</span> {student.firstName} {student.lastName}
+      </p>
+      <div className="flex gap-2 shrink-0">
+        {[[true,'Yes'],[false,'No']].map(([val,label]) => (
+          <button
+            key={String(val)}
+            type="button"
+            disabled={disabled}
+            onClick={() => set(val)}
+            className={"btn-touch px-4 py-2 rounded-xl font-semibold text-sm transition-fast border-2 " + ((!!e.attending) === val ? 'bg-primary text-white border-primary' : 'bg-gray-50 text-gray-400 border-gray-200 hover:bg-gray-100')}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function StudentEntryCard({ student, entry, onChange, disabled, kind, isStaff }) {
   const isBreakfast = kind === 'breakfast';
   const isFinal = kind === 'final';
+  if (isStaff) return <StaffEntryCard student={student} entry={entry} onChange={onChange} disabled={disabled} />;
   const e = entry || (isBreakfast ? defaultBreakfastEntry() : defaultEntry());
   function set(patch) { if (!disabled) onChange({ ...e, ...patch }); }
   function setMeal(meal) { set({ meal, milk: meal === 'hot' ? 'yes' : 'no' }); }
@@ -1745,8 +1841,85 @@ function ReviewStudentCard({ student, entry, onChange, kind }) {
   );
 }
 
-function ReviewScreen({ stage, cls, roster, entries, onChangeEntry, onEdit, onSubmit, targetDateLabel, adultsCount, onChangeAdults, showAdultCard }) {
+// Simple Yes/No pill for a staff member's row inside the Staff & Adults review screen — no
+// milk/meal-type controls apply here.
+function StaffReviewCard({ student, entry, onChange }) {
+  const e = entry || defaultStaffEntry();
+  return (
+    <div className="bg-white rounded-xl card-shadow border border-primary-100 p-3 flex items-center gap-3">
+      <p className="font-medium text-primary-900 truncate text-sm flex-1 min-w-0"><span className="text-primary-400">#{student.number}</span> {student.firstName} {student.lastName}</p>
+      <select
+        value={e.attending ? 'yes' : 'no'}
+        onChange={ev => onChange({ attending: ev.target.value === 'yes' })}
+        className="text-xs font-semibold border-2 border-primary-200 rounded-lg px-2 py-1 bg-white"
+      >
+        <option value="yes">Yes</option>
+        <option value="no">No</option>
+      </select>
+    </div>
+  );
+}
+
+function ReviewScreen({ stage, cls, roster, entries, onChangeEntry, onEdit, onSubmit, targetDateLabel, adultsCount, onChangeAdults, showAdultCard, isStaff }) {
   const isBreakfast = stage === 'breakfast';
+
+  if (isStaff) {
+    const staffTotals = tallyStaffEntries(entries, roster);
+    const yesStaff = [], noStaff = [];
+    roster.forEach(s => {
+      const e = entries[s.id] || defaultStaffEntry();
+      (e.attending ? yesStaff : noStaff).push(s);
+    });
+    const titles = { pre: "Review Today's Lunch Count", final: "Review Today's Final Lunch Count" };
+    const submitLabels = { pre: "Submit Today's Lunch Count", final: "Submit Today's Final Lunch Count" };
+    return (
+      <div>
+        <FloatingSummary isStaff staffCount={staffTotals.yes} adultsCount={showAdultCard ? adultsCount : null} />
+        <button onClick={onEdit} className="text-primary font-semibold text-sm mb-4 hover:underline">&larr; Edit / Go Back</button>
+        <h2 className="text-2xl font-bold text-primary-900 mb-1">{titles[stage]}</h2>
+        <p className="text-primary-600 font-light mb-6">{cls.grade} &middot; {cls.teacher} &middot; {formatDisplayDate(todayStr())}</p>
+
+        {showAdultCard && (
+          <div className="mb-6">
+            <AdultsCounterCard count={adultsCount} onChange={onChangeAdults} />
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-3 mb-6 sm:max-w-sm">
+          <StatCard label="Staff Count" value={staffTotals.yes} />
+          <StatCard label="Adult Count" value={adultsCount || 0} />
+        </div>
+
+        <div className="grid md:grid-cols-2 gap-4 mb-6">
+          {[{ key: 'yes', label: 'Yes', students: yesStaff, color: 'border-green-300 bg-green-50' }, { key: 'no', label: 'No', students: noStaff, color: 'border-gray-300 bg-gray-50' }].map(col => (
+            <div key={col.key} className={"rounded-2xl border-2 p-3 " + col.color}>
+              <div className="flex justify-between items-center mb-3 px-1">
+                <h3 className="font-bold text-primary-900 text-sm uppercase tracking-wide">{col.label}</h3>
+                <span className="text-sm font-bold text-primary-900 bg-white rounded-full px-2.5 py-0.5 border border-primary-100">{col.students.length}</span>
+              </div>
+              <div className="flex flex-col gap-2 min-h-[60px]">
+                {col.students.length === 0 && <p className="text-xs font-light text-primary-400 text-center py-4">No staff</p>}
+                {col.students.map(s => (
+                  <StaffReviewCard key={s.id} student={s} entry={entries[s.id] || defaultStaffEntry()} onChange={(entry) => onChangeEntry(s.id, entry)} />
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="sticky bottom-0 bg-secondary/95 backdrop-blur pt-4 pb-2 border-t border-primary-100">
+          <div className="flex justify-between items-center flex-wrap gap-3">
+            <p className="text-sm text-primary-600 font-light lg:hidden">Staff Count {staffTotals.yes}{showAdultCard ? (' \u00b7 Adult Count ' + (adultsCount || 0)) : ''}</p>
+            <div className="flex gap-3 ml-auto">
+              <GhostButton onClick={onEdit}>Edit / Go Back</GhostButton>
+              <PrimaryButton onClick={onSubmit}>{submitLabels[stage]}</PrimaryButton>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   const defaultFn = isBreakfast ? defaultBreakfastEntry : defaultEntry;
   const totals = tallyEntries(entries, roster, defaultFn);
   const hotStudents = [], sackStudents = [], absentStudents = [];
@@ -1839,17 +2012,20 @@ function ReviewScreen({ stage, cls, roster, entries, onChangeEntry, onEdit, onSu
 // Today's Final Lunch Count. Each step unlocks only once the one before it has been submitted.
 // For "Staff & Adults" classrooms (isStaff), the Breakfast Pre-Count step is skipped entirely -
 // only Today's Lunch Count and Today's Final Lunch Count are offered.
-function ClassroomEntryModal({ cls, isStaff, preSubmitted, breakfastSubmitted, finalSubmitted, targetDateLabel, onSelectPre, onSelectBreakfast, onSelectFinal, onClose }) {
+// steps: the ordered list of stages actually offered for this classroom (see activeStages()) —
+// disabled stages (an admin unchecked them under Admin -> Classrooms) are skipped entirely, not
+// just locked, and the "submit X first" gating only looks at whichever stage remains before it.
+function ClassroomEntryModal({ cls, isStaff, steps, preSubmitted, breakfastSubmitted, finalSubmitted, targetDateLabel, onSelectPre, onSelectBreakfast, onSelectFinal, onClose }) {
   const [lockedError, setLockedError] = useState('');
 
-  function handleBreakfastClick() {
-    if (!preSubmitted) { setLockedError('breakfast'); return; }
-    onSelectBreakfast();
-  }
-  function handleFinalClick() {
-    if (isStaff) { if (!preSubmitted) { setLockedError('final'); return; } onSelectFinal(); return; }
-    if (!breakfastSubmitted) { setLockedError('final'); return; }
-    onSelectFinal();
+  const submittedMap = { pre: preSubmitted, breakfast: breakfastSubmitted, final: finalSubmitted };
+  const selectFns = { pre: onSelectPre, breakfast: onSelectBreakfast, final: onSelectFinal };
+  const labels = { pre: "Today's Lunch Count", breakfast: "Breakfast Pre-Count (for " + targetDateLabel + ")", final: "Today's Final Lunch Count" };
+
+  function handleClick(stage, idx) {
+    const prevStage = steps[idx - 1];
+    if (prevStage && !submittedMap[prevStage]) { setLockedError(stage); return; }
+    selectFns[stage]();
   }
 
   function StepButton({ step, label, done, locked, sublabel, onClick }) {
@@ -1885,25 +2061,23 @@ function ClassroomEntryModal({ cls, isStaff, preSubmitted, breakfastSubmitted, f
         <p className="text-sm font-light text-primary-600 mb-5 mt-2">Complete these steps in order.</p>
 
         <div className="flex flex-col gap-3">
-          <StepButton step="1" label="Today's Lunch Count" done={preSubmitted} locked={false} onClick={onSelectPre} />
-          {!isStaff && (
-            <StepButton
-              step="2"
-              label={"Breakfast Pre-Count (for " + targetDateLabel + ")"}
-              done={breakfastSubmitted}
-              locked={!preSubmitted}
-              sublabel={lockedError === 'breakfast' ? "Submit Today's Lunch Count first." : (preSubmitted && !breakfastSubmitted ? 'Ready for the Breakfast Pre-Count.' : null)}
-              onClick={handleBreakfastClick}
-            />
-          )}
-          <StepButton
-            step={isStaff ? '2' : '3'}
-            label="Today's Final Lunch Count"
-            done={finalSubmitted}
-            locked={isStaff ? !preSubmitted : !breakfastSubmitted}
-            sublabel={lockedError === 'final' ? (isStaff ? "Submit Today's Lunch Count first." : 'Submit the Breakfast Pre-Count first.') : ((isStaff ? preSubmitted : breakfastSubmitted) && !finalSubmitted ? "Ready for Today's Final Lunch Count." : null)}
-            onClick={handleFinalClick}
-          />
+          {steps.map((stage, idx) => {
+            const prevStage = steps[idx - 1];
+            const locked = !!prevStage && !submittedMap[prevStage];
+            const done = submittedMap[stage];
+            return (
+              <StepButton
+                key={stage}
+                step={String(idx + 1)}
+                label={labels[stage]}
+                done={done}
+                locked={locked}
+                sublabel={lockedError === stage ? ('Submit ' + labels[prevStage] + ' first.') : (!locked && !done && idx > 0 ? ('Ready for ' + labels[stage] + '.') : null)}
+                onClick={() => handleClick(stage, idx)}
+              />
+            );
+          })}
+          {steps.length === 0 && <p className="text-sm font-light text-primary-500 text-center py-4">All counts are disabled for this classroom. Ask your admin to enable one under Admin &rarr; Classrooms.</p>}
         </div>
 
         <button onClick={onClose} className="text-primary font-semibold text-sm mt-5 hover:underline w-full text-center">Close &amp; Return Home</button>
@@ -1936,10 +2110,17 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
   const [showEntryModal, setShowEntryModal] = useState(!verified);
   const [sortBy, setSortBy] = useState('number');
 
+  const steps = useMemo(() => activeStages(cls), [cls]);
+
+  useEffect(() => {
+    if (steps.length && steps.indexOf(stage) === -1) setStage(steps[0]);
+    // eslint-disable-next-line
+  }, [steps.join(',')]);
+
   useEffect(() => {
     if (!todayLog) {
       saveLogFull(today, classroomId, {
-        pre: { entries: emptyEntries(roster), submitted: false, submittedAt: null, adultsCount: 0 },
+        pre: { entries: isStaff ? emptyStaffEntries(roster) : emptyEntries(roster), submitted: false, submittedAt: null, adultsCount: 0 },
         breakfast: { entries: emptyBreakfastEntries(roster), submitted: false, submittedAt: null, targetDate: breakfastTargetDate },
         // NOTE: final.entries starts as a truly empty {} — NOT emptyEntries(roster). If it were
         // pre-filled with generic default entries here, `hasOwnFinalEntries` below would see a
@@ -1959,7 +2140,7 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
 
   const locked = verified || noSchool;
 
-  const preEntries = (todayLog && todayLog.pre && todayLog.pre.entries) || emptyEntries(roster);
+  const preEntries = (todayLog && todayLog.pre && todayLog.pre.entries) || (isStaff ? emptyStaffEntries(roster) : emptyEntries(roster));
   const breakfastEntries = (todayLog && todayLog.breakfast && todayLog.breakfast.entries) || emptyBreakfastEntries(roster);
   // True only once the teacher has actually put their own data into Final (by editing a card
   // while on the Final stage, or by submitting Final at least once). Until then this stays
@@ -1977,7 +2158,7 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
 
   function emptyBase() {
     return {
-      pre: { entries: emptyEntries(roster), submitted: false, submittedAt: null, adultsCount: 0 },
+      pre: { entries: isStaff ? emptyStaffEntries(roster) : emptyEntries(roster), submitted: false, submittedAt: null, adultsCount: 0 },
       breakfast: { entries: emptyBreakfastEntries(roster), submitted: false, submittedAt: null, targetDate: breakfastTargetDate },
       // Same reasoning as the useEffect above: keep this {} so a fresh/never-touched Final Count
       // mirrors the Pre-Count instead of generic defaults.
@@ -2055,18 +2236,28 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
   const submitFns = { pre: submitPre, breakfast: submitBreakfast, final: submitFinal };
   const activeEntries = stage === 'pre' ? preEntries : stage === 'breakfast' ? breakfastEntries : finalEntries;
   const activeAdultsCount = stage === 'final' ? finalAdultsCount : preAdultsCount;
-  const totals = tallyEntries(activeEntries, roster, stage === 'breakfast' ? defaultBreakfastEntry : defaultEntry);
+  const staffTotals = isStaff ? tallyStaffEntries(activeEntries, roster) : null;
+  const totals = isStaff ? null : tallyEntries(activeEntries, roster, stage === 'breakfast' ? defaultBreakfastEntry : defaultEntry);
   const sortedRoster = sortStudents(roster, sortBy);
   const stageLabels = { pre: "Today's Lunch Count", breakfast: 'Breakfast Pre-Count', final: "Today's Final Lunch Count" };
 
   return (
     <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8 lg:pl-40">
-      {!reviewing && roster.length > 0 && <FloatingSummary totals={totals} hideMilk={stage === 'breakfast'} />}
+      {!reviewing && roster.length > 0 && (
+        <FloatingSummary
+          totals={totals}
+          hideMilk={stage === 'breakfast'}
+          isStaff={isStaff}
+          staffCount={staffTotals && staffTotals.yes}
+          adultsCount={showAdultCard ? activeAdultsCount : null}
+        />
+      )}
 
       {showEntryModal && roster.length > 0 && (
         <ClassroomEntryModal
           cls={cls}
           isStaff={isStaff}
+          steps={steps}
           preSubmitted={preSubmitted}
           breakfastSubmitted={breakfastSubmitted}
           finalSubmitted={finalSubmitted}
@@ -2112,34 +2303,33 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
           adultsCount={activeAdultsCount}
           onChangeAdults={(count) => updateAdults(stage, count)}
           showAdultCard={showAdultCard && stage !== 'breakfast'}
+          isStaff={isStaff}
         />
       ) : (
         <React.Fragment>
           <div className="flex gap-2 mb-6 flex-wrap">
-            <button
-              onClick={() => setStage('pre')}
-              className={"btn-touch px-5 py-2.5 rounded-xl font-semibold text-sm transition-fast border-2 " + (stage === 'pre' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
-            >
-              1. Today's Lunch Count {preSubmitted ? '✓' : ''}
-            </button>
-            {!isStaff && (
-              <button
-                onClick={() => { if (preSubmitted) setStage('breakfast'); }}
-                disabled={!preSubmitted}
-                title={!preSubmitted ? "Submit Today's Lunch Count first" : ''}
-                className={"btn-touch px-5 py-2.5 rounded-xl font-semibold text-sm transition-fast border-2 disabled:opacity-40 disabled:cursor-not-allowed " + (stage === 'breakfast' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
-              >
-                2. Breakfast Pre-Count {breakfastSubmitted ? '✓' : ''}{!preSubmitted ? ' 🔒' : ''}
-              </button>
+            {steps.length === 0 && (
+              <p className="text-sm font-light text-primary-500">All counts are disabled for this classroom. Ask your admin to enable one under Admin &rarr; Classrooms.</p>
             )}
-            <button
-              onClick={() => { if (isStaff ? preSubmitted : breakfastSubmitted) setStage('final'); }}
-              disabled={isStaff ? !preSubmitted : !breakfastSubmitted}
-              title={(isStaff ? !preSubmitted : !breakfastSubmitted) ? (isStaff ? "Submit Today's Lunch Count first" : 'Submit the Breakfast Pre-Count first') : ''}
-              className={"btn-touch px-5 py-2.5 rounded-xl font-semibold text-sm transition-fast border-2 disabled:opacity-40 disabled:cursor-not-allowed " + (stage === 'final' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
-            >
-              {isStaff ? '2' : '3'}. Today's Final Lunch Count {finalSubmitted ? '✓' : ''}{(isStaff ? !preSubmitted : !breakfastSubmitted) ? ' 🔒' : ''}
-            </button>
+            {(() => {
+              const stepLabels = { pre: "Today's Lunch Count", breakfast: 'Breakfast Pre-Count', final: "Today's Final Lunch Count" };
+              const submittedMap = { pre: preSubmitted, breakfast: breakfastSubmitted, final: finalSubmitted };
+              return steps.map((stg, idx) => {
+                const prevStage = steps[idx - 1];
+                const isLocked = !!prevStage && !submittedMap[prevStage];
+                return (
+                  <button
+                    key={stg}
+                    onClick={() => { if (!isLocked) setStage(stg); }}
+                    disabled={isLocked}
+                    title={isLocked ? ('Submit ' + stepLabels[prevStage] + ' first') : ''}
+                    className={"btn-touch px-5 py-2.5 rounded-xl font-semibold text-sm transition-fast border-2 disabled:opacity-40 disabled:cursor-not-allowed " + (stage === stg ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
+                  >
+                    {idx + 1}. {stepLabels[stg]} {submittedMap[stg] ? '✓' : ''}{isLocked ? ' 🔒' : ''}
+                  </button>
+                );
+              });
+            })()}
           </div>
 
           {!preSubmitted && stage === 'pre' && !isStaff && (
@@ -2193,10 +2383,11 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
               <StudentEntryCard
                 key={s.id}
                 student={s}
-                entry={activeEntries[s.id] || (stage === 'breakfast' ? defaultBreakfastEntry() : defaultEntry())}
+                entry={activeEntries[s.id] || (isStaff ? defaultStaffEntry() : stage === 'breakfast' ? defaultBreakfastEntry() : defaultEntry())}
                 onChange={(entry) => updateEntry(stage, s.id, entry)}
                 disabled={locked}
                 kind={stage === 'breakfast' ? 'breakfast' : stage === 'final' ? 'final' : 'lunch'}
+                isStaff={isStaff}
               />
             ))}
           </div>
@@ -2204,7 +2395,8 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
           <div className="sticky bottom-0 bg-secondary/95 backdrop-blur pt-4 pb-2 border-t border-primary-100">
             <div className="flex justify-between items-center flex-wrap gap-3">
               <p className="text-sm text-primary-600 font-light lg:hidden">
-                {totals.hot} &middot; {totals.sack} &middot; Absent {totals.absent}{stage !== 'breakfast' ? (' \u00b7 Milk ' + totals.milk) : ''}
+                {isStaff ? ('Staff count ' + (staffTotals ? staffTotals.yes : 0) + (showAdultCard ? (' \u00b7 Adult count ' + (activeAdultsCount || 0)) : '')) :
+                  (totals.hot + ' \u00b7 ' + totals.sack + ' \u00b7 Absent ' + totals.absent + (stage !== 'breakfast' ? (' \u00b7 Milk ' + totals.milk) : ''))}
               </p>
               <div className="flex gap-3 ml-auto">
                 <GhostButton onClick={onBack}>Cancel</GhostButton>
@@ -2217,49 +2409,38 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
         </React.Fragment>
       )}
 
-      {successInfo && successInfo.stage === 'pre' && !isStaff && (
-        <SuccessModal
-          title="Lunch Count Submitted!"
-          message={"Today's Lunch Count has been saved. Next, take the Breakfast Pre-Count for " + formatShortDate(breakfastTargetDate) + '.'}
-        >
-          <div className="flex flex-col gap-3">
-            <button
-              onClick={goToBreakfastFromSuccess}
-              className="btn-touch w-full px-5 py-3 rounded-xl bg-green-600 text-white font-semibold text-base transition-fast hover:bg-green-700 active:scale-[0.98]"
-            >
-              Take Breakfast Pre-Count Next &rarr;
-            </button>
-            <button
-              onClick={handleDone}
-              className="btn-touch w-full px-4 py-2.5 rounded-xl bg-gray-100 text-gray-400 font-medium text-sm border border-gray-200 hover:bg-gray-200 hover:text-gray-500 transition-fast"
-            >
-              Return Home
-            </button>
-          </div>
-        </SuccessModal>
-      )}
-
-      {successInfo && successInfo.stage === 'pre' && isStaff && (
-        <SuccessModal
-          title="Lunch Count Submitted!"
-          message="Today's Lunch Count has been saved. Next, take Today's Final Lunch Count."
-        >
-          <div className="flex flex-col gap-3">
-            <button
-              onClick={goToFinalFromSuccess}
-              className="btn-touch w-full px-5 py-3 rounded-xl bg-green-600 text-white font-semibold text-base transition-fast hover:bg-green-700 active:scale-[0.98]"
-            >
-              Take Today's Final Lunch Count Next &rarr;
-            </button>
-            <button
-              onClick={handleDone}
-              className="btn-touch w-full px-4 py-2.5 rounded-xl bg-gray-100 text-gray-400 font-medium text-sm border border-gray-200 hover:bg-gray-200 hover:text-gray-500 transition-fast"
-            >
-              Return Home
-            </button>
-          </div>
-        </SuccessModal>
-      )}
+      {successInfo && successInfo.stage === 'pre' && (() => {
+        const nextStage = steps[steps.indexOf('pre') + 1];
+        if (!nextStage) {
+          return (
+            <SuccessModal title="Lunch Count Submitted!" message="Today's Lunch Count has been saved." onDone={handleDone} />
+          );
+        }
+        const isNextBreakfast = nextStage === 'breakfast';
+        return (
+          <SuccessModal
+            title="Lunch Count Submitted!"
+            message={isNextBreakfast
+              ? ("Today's Lunch Count has been saved. Next, take the Breakfast Pre-Count for " + formatShortDate(breakfastTargetDate) + '.')
+              : "Today's Lunch Count has been saved. Next, take Today's Final Lunch Count."}
+          >
+            <div className="flex flex-col gap-3">
+              <button
+                onClick={isNextBreakfast ? goToBreakfastFromSuccess : goToFinalFromSuccess}
+                className="btn-touch w-full px-5 py-3 rounded-xl bg-green-600 text-white font-semibold text-base transition-fast hover:bg-green-700 active:scale-[0.98]"
+              >
+                {isNextBreakfast ? 'Take Breakfast Pre-Count Next \u2192' : "Take Today's Final Lunch Count Next \u2192"}
+              </button>
+              <button
+                onClick={handleDone}
+                className="btn-touch w-full px-4 py-2.5 rounded-xl bg-gray-100 text-gray-400 font-medium text-sm border border-gray-200 hover:bg-gray-200 hover:text-gray-500 transition-fast"
+              >
+                Return Home
+              </button>
+            </div>
+          </SuccessModal>
+        );
+      })()}
 
       {successInfo && successInfo.stage !== 'pre' && (
         <SuccessModal
@@ -2345,27 +2526,35 @@ function LunchVerificationTab({ data }) {
       ) : (
         <div className="grid gap-4">
           {sortClassroomsByGrade(data.classrooms).map(cls => {
+            const isStaffCls = cls.type === 'staff';
             const roster = sortStudents(data.students.filter(s => s.classroomId === cls.id), 'number');
             const log = data.logsById[logId(dateVal, cls.id)];
             const preEntries = (log && log.pre && log.pre.entries) || {};
             const finalEntries = (log && log.final && log.final.entries) || {};
-            const preT = tallyEntries(preEntries, roster);
-            const finalT = tallyEntries(finalEntries, roster);
+            const preT = isStaffCls ? tallyStaffEntries(preEntries, roster) : tallyEntries(preEntries, roster);
+            const finalT = isStaffCls ? tallyStaffEntries(finalEntries, roster) : tallyEntries(finalEntries, roster);
+            const preAdultsCount = (log && log.pre && log.pre.adultsCount) || 0;
+            const finalAdultsCount = (log && log.final && typeof log.final.adultsCount === 'number') ? log.final.adultsCount : preAdultsCount;
             const preSubmitted = !!(log && log.pre && log.pre.submitted);
             const finalSubmitted = !!(log && log.final && log.final.submitted);
             const verified = !!(log && log.verified);
             const status = verified ? 'Verified' : (finalSubmitted ? 'Completed' : (preSubmitted ? 'In Progress' : 'Not Started'));
             const isCollapsed = !!collapsed[cls.id];
 
-            const changedStudents = finalSubmitted ? roster.filter(s => entryChanged(preEntries[s.id], finalEntries[s.id])) : [];
+            const changedStudents = (!isStaffCls && finalSubmitted) ? roster.filter(s => entryChanged(preEntries[s.id], finalEntries[s.id])) : [];
             const summaryDiffs = [];
             if (finalSubmitted) {
-              [['Hot Lunch','hot'],['Sack Lunch','sack'],['Absent','absent'],['Milk','milk']].forEach(([label,key]) => {
-                if (preT[key] !== finalT[key]) {
-                  const delta = finalT[key] - preT[key];
-                  summaryDiffs.push(label + ': ' + preT[key] + ' \u2192 ' + finalT[key] + ' (' + (delta > 0 ? '+' : '') + delta + ')');
-                }
-              });
+              if (isStaffCls) {
+                if (preT.yes !== finalT.yes) summaryDiffs.push('Staff Count: ' + preT.yes + ' \u2192 ' + finalT.yes + ' (' + (finalT.yes - preT.yes > 0 ? '+' : '') + (finalT.yes - preT.yes) + ')');
+                if (cls.showAdultCard && preAdultsCount !== finalAdultsCount) summaryDiffs.push('Adult Count: ' + preAdultsCount + ' \u2192 ' + finalAdultsCount + ' (' + (finalAdultsCount - preAdultsCount > 0 ? '+' : '') + (finalAdultsCount - preAdultsCount) + ')');
+              } else {
+                [['Hot Lunch','hot'],['Sack Lunch','sack'],['Absent','absent'],['Milk','milk']].forEach(([label,key]) => {
+                  if (preT[key] !== finalT[key]) {
+                    const delta = finalT[key] - preT[key];
+                    summaryDiffs.push(label + ': ' + preT[key] + ' \u2192 ' + finalT[key] + ' (' + (delta > 0 ? '+' : '') + delta + ')');
+                  }
+                });
+              }
             }
 
             return (
@@ -2375,7 +2564,7 @@ function LunchVerificationTab({ data }) {
                     <CollapseToggle collapsed={isCollapsed} onClick={() => toggleCollapse(cls.id)} />
                     <div className="min-w-0">
                       <h4 className="font-bold text-primary-900 truncate">{classroomLabel(cls)}</h4>
-                      <p className="text-xs font-light text-primary-500">{roster.length} students{changedStudents.length > 0 ? ' \u00b7 ' + changedStudents.length + ' changed since morning' : ''}</p>
+                      <p className="text-xs font-light text-primary-500">{roster.length} {isStaffCls ? 'staff' : 'students'}{changedStudents.length > 0 ? ' \u00b7 ' + changedStudents.length + ' changed since morning' : ''}</p>
                     </div>
                   </div>
                   <Badge status={status} />
@@ -2383,7 +2572,27 @@ function LunchVerificationTab({ data }) {
 
                 {!isCollapsed && (
                 <React.Fragment>
-                {verified ? (
+                {isStaffCls ? (
+                  verified ? (
+                    <div className="bg-purple-50 border border-purple-200 rounded-xl p-4 mb-4">
+                      <p className="text-xs font-semibold text-purple-700 uppercase mb-2">Verified Final Count</p>
+                      <p className="font-bold text-primary-900 text-sm leading-snug">Staff Count: {finalT.yes}</p>
+                      {cls.showAdultCard && <p className="font-bold text-primary-900 text-sm leading-snug">Adult Count: {finalAdultsCount}</p>}
+                      <p className="font-bold text-purple-700 text-sm leading-snug mt-1">Verified</p>
+                    </div>
+                  ) : (
+                    <div className="grid sm:grid-cols-2 gap-4 mb-4">
+                      <div className="bg-primary-50 rounded-xl p-3">
+                        <p className="text-xs font-semibold text-primary-700 uppercase mb-1">Today's Lunch Count {preSubmitted ? '' : '(not submitted)'}</p>
+                        <p className="text-sm text-primary-800">Staff Count {preT.yes}{cls.showAdultCard ? (' \u00b7 Adult Count ' + preAdultsCount) : ''}</p>
+                      </div>
+                      <div className="bg-primary-50 rounded-xl p-3">
+                        <p className="text-xs font-semibold text-primary-700 uppercase mb-1">Today's Final Lunch Count {finalSubmitted ? '' : '(not submitted)'}</p>
+                        <p className="text-sm text-primary-800">Staff Count {finalT.yes}{cls.showAdultCard ? (' \u00b7 Adult Count ' + finalAdultsCount) : ''}</p>
+                      </div>
+                    </div>
+                  )
+                ) : verified ? (
                   <div className="bg-purple-50 border border-purple-200 rounded-xl p-4 mb-4">
                     <p className="text-xs font-semibold text-purple-700 uppercase mb-2">Verified Final Count</p>
                     <p className="font-bold text-primary-900 text-sm leading-snug">Hot: {finalT.hot}</p>
@@ -2412,13 +2621,13 @@ function LunchVerificationTab({ data }) {
                   </div>
                 )}
 
-                {finalSubmitted && (
+                {!isStaffCls && finalSubmitted && (
                   <button onClick={() => toggleExpand(cls.id)} className="text-xs font-semibold text-primary hover:underline mb-3">
                     {expanded[cls.id] ? 'Hide Student Detail \u25b2' : 'Show Student Detail \u25bc'}
                   </button>
                 )}
 
-                {finalSubmitted && expanded[cls.id] && (
+                {!isStaffCls && finalSubmitted && expanded[cls.id] && (
                   <div className="border border-primary-100 rounded-xl overflow-hidden mb-4 overflow-x-auto">
                     <p className="text-xs font-semibold text-primary-500 uppercase px-2 pt-2 bg-primary-50">Verified Final Count</p>
                     <table className="w-full text-sm">
@@ -2641,19 +2850,24 @@ function VerificationPanel({ data }) {
 function TodaySnapshotCards({ data }) {
   const pre = useMemo(() => computeTodayPreCountSnapshot(data), [data]);
   const ver = useMemo(() => computeTodayVerifiedSnapshot(data), [data]);
+  const staffAdult = useMemo(() => computeTodayStaffAdultSnapshot(data), [data]);
   return (
     <div className="grid md:grid-cols-2 gap-4 mb-8">
       <div className="bg-white rounded-2xl card-shadow border-2 border-amber-200 p-5">
         <h4 className="font-bold text-primary-900 mb-1">Today's PreCount</h4>
         <p className="text-xs font-light text-primary-500 mb-4">Live &mdash; fills in as teachers submit Today's Lunch Count, before Final Count / verification.</p>
         <div className="grid grid-cols-3 gap-3 mb-3">
-          <StatCard label="Today's Hot Lunch" value={pre.hot} />
+          <StatCard label="Today's Total Hot Lunch" value={pre.hot} />
           <StatCard label="Today's Sack Lunch" value={pre.sack} />
           <StatCard label="Today's Absences" value={pre.absent} />
         </div>
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-2 gap-3 mb-3">
           <StatCard label="Hot Lunch Milk" value={pre.milkHot} />
           <StatCard label="Sack Lunch Milk" value={pre.milkSack} />
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <StatCard label="Staff Lunch" value={staffAdult.staffLunch} />
+          <StatCard label="Adult Lunch" value={staffAdult.adultLunch} />
         </div>
       </div>
       <div className="bg-white rounded-2xl card-shadow border-2 border-purple-200 p-5">
@@ -3488,17 +3702,17 @@ function StaffManagement({ data }) {
 
 /* ============================ ADMIN: CLASSROOM MANAGEMENT ============================ */
 function ClassroomManagement({ data }) {
-  const [form, setForm] = useState({ grade: '', teacher: '', type: 'class', showAdultCard: false });
+  const [form, setForm] = useState({ grade: '', teacher: '', type: 'class', showAdultCard: false, enablePre: true, enableBreakfast: true, enableFinal: true });
   const [editingId, setEditingId] = useState(null);
-  const [editForm, setEditForm] = useState({ grade: '', teacher: '', type: 'class', showAdultCard: false });
+  const [editForm, setEditForm] = useState({ grade: '', teacher: '', type: 'class', showAdultCard: false, enablePre: true, enableBreakfast: true, enableFinal: true });
   const [collapsed, setCollapsed] = useState({});
   function toggleCollapse(id) { setCollapsed(prev => ({ ...prev, [id]: !prev[id] })); }
 
   async function addClassroom(e) {
     e.preventDefault();
     if (!form.grade.trim() || !form.teacher.trim()) return;
-    await saveClassroom({ grade: form.grade.trim(), teacher: form.teacher.trim(), type: form.type, showAdultCard: form.type === 'staff' && form.showAdultCard });
-    setForm({ grade: '', teacher: '', type: 'class', showAdultCard: false });
+    await saveClassroom({ grade: form.grade.trim(), teacher: form.teacher.trim(), type: form.type, showAdultCard: form.type === 'staff' && form.showAdultCard, enablePre: form.enablePre, enableBreakfast: form.enableBreakfast, enableFinal: form.enableFinal });
+    setForm({ grade: '', teacher: '', type: 'class', showAdultCard: false, enablePre: true, enableBreakfast: true, enableFinal: true });
   }
 
   async function deleteClassroom(id) {
@@ -3508,10 +3722,21 @@ function ClassroomManagement({ data }) {
     await deleteClassroomDoc(id);
   }
 
-  function startEdit(c) { setEditingId(c.id); setEditForm({ grade: c.grade, teacher: c.teacher, type: c.type || 'class', showAdultCard: !!c.showAdultCard }); }
+  function startEdit(c) { setEditingId(c.id); setEditForm({ grade: c.grade, teacher: c.teacher, type: c.type || 'class', showAdultCard: !!c.showAdultCard, enablePre: c.enablePre !== false, enableBreakfast: c.enableBreakfast !== false, enableFinal: c.enableFinal !== false }); }
   async function saveEdit(id) {
-    await saveClassroom({ id, grade: editForm.grade.trim(), teacher: editForm.teacher.trim(), type: editForm.type, showAdultCard: editForm.type === 'staff' && editForm.showAdultCard });
+    await saveClassroom({ id, grade: editForm.grade.trim(), teacher: editForm.teacher.trim(), type: editForm.type, showAdultCard: editForm.type === 'staff' && editForm.showAdultCard, enablePre: editForm.enablePre, enableBreakfast: editForm.enableBreakfast, enableFinal: editForm.enableFinal });
     setEditingId(null);
+  }
+
+  // Quick inline toggle for the enable/disable checkboxes shown on every classroom card, without
+  // needing to enter Edit mode first.
+  async function toggleStage(c, stageField) {
+    await saveClassroom({
+      id: c.id, grade: c.grade, teacher: c.teacher, type: c.type || 'class', showAdultCard: !!c.showAdultCard,
+      enablePre: stageField === 'enablePre' ? !(c.enablePre !== false) : (c.enablePre !== false),
+      enableBreakfast: stageField === 'enableBreakfast' ? !(c.enableBreakfast !== false) : (c.enableBreakfast !== false),
+      enableFinal: stageField === 'enableFinal' ? !(c.enableFinal !== false) : (c.enableFinal !== false)
+    });
   }
 
   return (
@@ -3540,6 +3765,22 @@ function ClassroomManagement({ data }) {
             Enable Parent/Adult Card
           </label>
         )}
+        <div className="flex flex-wrap gap-3 pb-2">
+          <label className="flex items-center gap-1.5 text-xs font-semibold text-primary-700">
+            <input type="checkbox" checked={form.enablePre} onChange={e => setForm({ ...form, enablePre: e.target.checked })} />
+            Morning Pre-Count
+          </label>
+          {form.type !== 'staff' && (
+            <label className="flex items-center gap-1.5 text-xs font-semibold text-primary-700">
+              <input type="checkbox" checked={form.enableBreakfast} onChange={e => setForm({ ...form, enableBreakfast: e.target.checked })} />
+              Breakfast Count
+            </label>
+          )}
+          <label className="flex items-center gap-1.5 text-xs font-semibold text-primary-700">
+            <input type="checkbox" checked={form.enableFinal} onChange={e => setForm({ ...form, enableFinal: e.target.checked })} />
+            Lunch Final Count
+          </label>
+        </div>
         <PrimaryButton type="submit">Add Classroom</PrimaryButton>
       </form>
 
@@ -3561,6 +3802,22 @@ function ClassroomManagement({ data }) {
                     Enable Parent/Adult Card
                   </label>
                 )}
+                <div className="flex flex-wrap gap-3">
+                  <label className="flex items-center gap-1.5 text-xs font-semibold text-primary-700">
+                    <input type="checkbox" checked={editForm.enablePre} onChange={e => setEditForm({ ...editForm, enablePre: e.target.checked })} />
+                    Morning Pre-Count
+                  </label>
+                  {editForm.type !== 'staff' && (
+                    <label className="flex items-center gap-1.5 text-xs font-semibold text-primary-700">
+                      <input type="checkbox" checked={editForm.enableBreakfast} onChange={e => setEditForm({ ...editForm, enableBreakfast: e.target.checked })} />
+                      Breakfast Count
+                    </label>
+                  )}
+                  <label className="flex items-center gap-1.5 text-xs font-semibold text-primary-700">
+                    <input type="checkbox" checked={editForm.enableFinal} onChange={e => setEditForm({ ...editForm, enableFinal: e.target.checked })} />
+                    Lunch Final Count
+                  </label>
+                </div>
                 <div className="flex gap-2 mt-1">
                   <button onClick={() => saveEdit(c.id)} className="px-3 py-1.5 rounded-lg bg-primary text-white text-sm font-semibold">Save</button>
                   <button onClick={() => setEditingId(null)} className="px-3 py-1.5 rounded-lg bg-gray-100 text-gray-600 text-sm font-semibold">Cancel</button>
@@ -3586,6 +3843,24 @@ function ClassroomManagement({ data }) {
                     <button onClick={() => deleteClassroom(c.id)} className="px-3 py-1.5 rounded-lg bg-rose-50 text-rose-600 text-sm font-semibold hover:bg-rose-100">Delete</button>
                   </div>
                 </div>
+                {!collapsed[c.id] && (
+                  <div className="flex flex-wrap gap-3 mt-3 pt-3 border-t border-primary-50">
+                    <label className="flex items-center gap-1.5 text-xs font-semibold text-primary-700">
+                      <input type="checkbox" checked={c.enablePre !== false} onChange={() => toggleStage(c, 'enablePre')} />
+                      Morning Pre-Count
+                    </label>
+                    {c.type !== 'staff' && (
+                      <label className="flex items-center gap-1.5 text-xs font-semibold text-primary-700">
+                        <input type="checkbox" checked={c.enableBreakfast !== false} onChange={() => toggleStage(c, 'enableBreakfast')} />
+                        Breakfast Count
+                      </label>
+                    )}
+                    <label className="flex items-center gap-1.5 text-xs font-semibold text-primary-700">
+                      <input type="checkbox" checked={c.enableFinal !== false} onChange={() => toggleStage(c, 'enableFinal')} />
+                      Lunch Final Count
+                    </label>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -3948,7 +4223,20 @@ function StudentRecordEditor({ data }) {
     setBusy(false);
   }
 
-  function EntryEditor({ label, entry, stageKey, kind }) {
+  function EntryEditor({ label, entry, stageKey, kind, isStaff }) {
+    if (isStaff) {
+      const e = entry || defaultStaffEntry();
+      return (
+        <div className="bg-primary-50 rounded-xl p-4">
+          <p className="text-xs font-semibold text-primary-700 uppercase mb-2">{label}{!entry && ' (no entry saved)'}</p>
+          <div className="flex flex-wrap gap-2">
+            <button onClick={() => saveEntry(stageKey, { attending: true })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (e.attending ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>Yes</button>
+            <button onClick={() => saveEntry(stageKey, { attending: false })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (!e.attending ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>No</button>
+            {entry && <button onClick={() => clearEntry(stageKey)} className="px-3 py-1.5 rounded-lg text-xs font-semibold border-2 bg-white text-rose-600 border-rose-200">Remove Entry</button>}
+          </div>
+        </div>
+      );
+    }
     const isBreakfast = kind === 'breakfast';
     const e = entry || (isBreakfast ? defaultBreakfastEntry() : defaultEntry());
     return (
@@ -4011,9 +4299,9 @@ function StudentRecordEditor({ data }) {
         <p className="text-sm font-light text-primary-500">This classroom has no students yet.</p>
       ) : (
         <div className={"grid gap-4 " + (isStaffClassroom ? 'sm:grid-cols-2' : 'sm:grid-cols-3')}>
-          <EntryEditor label="Today's Lunch Count" entry={preEntry} stageKey="pre" kind="lunch" />
+          <EntryEditor label="Today's Lunch Count" entry={preEntry} stageKey="pre" kind="lunch" isStaff={isStaffClassroom} />
           {!isStaffClassroom && <EntryEditor label={"Breakfast Pre-Count (for " + breakfastTargetLabel + ")"} entry={breakfastEntry} stageKey="breakfast" kind="breakfast" />}
-          <EntryEditor label="Today's Final Lunch Count" entry={finalEntry} stageKey="final" kind="lunch" />
+          <EntryEditor label="Today's Final Lunch Count" entry={finalEntry} stageKey="final" kind="lunch" isStaff={isStaffClassroom} />
         </div>
       )}
       {busy && <p className="text-xs text-primary-400 mt-2">Saving…</p>}
