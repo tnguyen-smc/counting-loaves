@@ -919,7 +919,11 @@ function buildMonthlyMealCountDays(data, year, month) {
 // Scans every day/classroom in the given month for a submitted Lunch Final Count that an admin
 // has NOT yet verified. The Monthly Lunch Meal Count Export refuses to run while this list is
 // non-empty, since an unverified final count could still change and shouldn't be locked into an
-// official reimbursement report. Returns [{ date, classroom }, ...] sorted by date.
+// official reimbursement report. Staff & Adults classrooms have no Final Lunch Count of their own
+// (see readyToVerify in LunchVerificationTab) — they're "fully submitted" once every staff member
+// has turned in their own Hot Lunch card — so they're checked the same way here, otherwise a fully
+// submitted but unverified Staff & Adults day would silently be left out of the export instead of
+// blocking it like every other unverified day does. Returns [{ date, classroom }, ...] sorted by date.
 function findUnverifiedLunchDays(data, year, month) {
   const numDays = daysInMonth(year, month);
   const problems = [];
@@ -927,7 +931,17 @@ function findUnverifiedLunchDays(data, year, month) {
     const dateStr = year + '-' + pad2(month) + '-' + pad2(day);
     sortClassroomsByGrade(data.classrooms).forEach(cls => {
       const log = data.logsById[logId(dateStr, cls.id)];
-      if (log && log.final && log.final.submitted && !log.verified) {
+      if (!log || log.verified) return;
+      if (cls.type === 'staff') {
+        const roster = data.students.filter(s => s.classroomId === cls.id);
+        if (roster.length === 0) return;
+        const entries = (log.pre && log.pre.entries) || {};
+        if (tallyStaffEntries(entries, roster).submittedCount >= roster.length) {
+          problems.push({ date: dateStr, classroom: cls });
+        }
+        return;
+      }
+      if (log.final && log.final.submitted) {
         problems.push({ date: dateStr, classroom: cls });
       }
     });
@@ -935,71 +949,93 @@ function findUnverifiedLunchDays(data, year, month) {
   return problems;
 }
 
-// Builds a SheetJS workbook that mirrors the official monthly reimbursable meal count sheet:
-// same headers, same merged cells (Day of the Month / Student Lunches / Reimbursable), a Month
-// and Year field, one row per day 1-31 with live =SUM() formulas for Total Paid and Total, and
-// a Total row at the bottom that sums every column. Note: the free/community build of SheetJS
-// (loaded from the CDN) writes values, formulas, and merges faithfully, but it does not persist
-// cell styling (bold headers, borders) the way the original template file has them — the numbers
-// and formulas will match exactly, but you may want to re-apply borders/bold once opened in Excel.
-function buildMonthlyMealCountWorkbook(data, year, month) {
-  const days = buildMonthlyMealCountDays(data, year, month);
-  const ws = {};
-  function setCell(addr, value, isFormula) {
-    if (value === undefined || value === null) return;
-    if (isFormula) { ws[addr] = { t: 'n', f: value }; return; }
-    if (typeof value === 'number') { ws[addr] = { t: 'n', v: value }; return; }
-    ws[addr] = { t: 's', v: String(value) };
+// Per-day Staff & Adult lunch counts for the Monthly Lunch Meal Count Export, counted the same
+// verified-only way as buildMonthlyMealCountDays. Staff & Adults classrooms have no separate Final
+// Lunch Count — each staff member's own submitted Hot Lunch Yes/No (stored under `pre`) is the
+// definitive record for the day — so a day only counts once an admin has verified that classroom's
+// log for that date, mirroring computeTodayVerifiedStaffAdultSnapshot but across a whole month.
+function buildMonthlyStaffAdultDays(data, year, month) {
+  const numDays = daysInMonth(year, month);
+  const days = [];
+  for (let day = 1; day <= 31; day++) {
+    days.push(day > numDays ? null : { staff: 0, adult: 0, hasData: false });
   }
+  data.classrooms.forEach(cls => {
+    if (cls.type !== 'staff') return;
+    const roster = data.students.filter(s => s.classroomId === cls.id);
+    for (let day = 1; day <= numDays; day++) {
+      const dateStr = year + '-' + pad2(month) + '-' + pad2(day);
+      const log = data.logsById[logId(dateStr, cls.id)];
+      if (!log || !log.verified) continue;
+      const entries = (log.pre && log.pre.entries) || {};
+      const t = tallyStaffEntries(entries, roster);
+      const bucket = days[day - 1];
+      bucket.hasData = true;
+      bucket.staff += t.submittedYes;
+      if (cls.showAdultCard) bucket.adult += (log.pre && log.pre.adultsCount) || 0;
+    }
+  });
+  return days.map(d => (d && d.hasData) ? d : null);
+}
 
-  setCell('A1', 'Day of the Month');
-  setCell('B1', 'Student Lunches');
-  setCell('B2', 'Reimbursable');
-  setCell('I2', 'Month');
-  setCell('J2', monthNameOf(month));
-  setCell('K2', 'Year');
-  setCell('L2', year);
-  setCell('B3', 'Elem. School Paid');
-  setCell('C3', 'Middle School Paid');
-  setCell('D3', 'High School Paid');
-  setCell('E3', 'Total Paid');
-  setCell('F3', 'Reduced Price');
-  setCell('G3', 'Free');
-  setCell('H3', 'Total');
+// Path to the actual official monthly reimbursable meal count workbook, uploaded once by the
+// school and served as a static file at the site root (same level as shared.js/style.css). The
+// export loads THIS file fresh every time and only edits data cells, so every formula, merge,
+// border, font, and column width from the original template survives untouched — nothing is
+// rebuilt from scratch.
+const LUNCH_TEMPLATE_PATH = '/lunch-export-template.xlsx';
+
+// Fetches and parses a template workbook. Thrown errors are meant to be caught by the caller and
+// shown to the admin (e.g. the file hasn't been uploaded to the site yet, or the path is wrong).
+async function fetchTemplateWorkbook(path) {
+  const resp = await fetch(path);
+  if (!resp.ok) {
+    throw new Error('Could not load the export template at "' + path + '" (' + resp.status + '). Make sure lunch-export-template.xlsx has been uploaded to the site.');
+  }
+  const buf = await resp.arrayBuffer();
+  return XLSX.read(buf, { type: 'array' });
+}
+
+// Writes a value into a template cell, or clears it when there's no data for that day — matching
+// the "left blank, just like the paper form" behavior for days with no submitted-and-verified count.
+function setTemplateCell(ws, addr, value) {
+  if (value === undefined || value === null) { delete ws[addr]; return; }
+  ws[addr] = (typeof value === 'string') ? { t: 's', v: value } : { t: 'n', v: value };
+}
+
+// Fills the official template (see LUNCH_TEMPLATE_PATH) with this month's data, using ONLY
+// classroom-days that are both submitted AND admin-verified (buildMonthlyMealCountDays /
+// buildMonthlyStaffAdultDays already enforce this — an unverified submitted count is left blank
+// rather than exported). Populates just the data cells the template expects real data in:
+//   B/C/D/F/G  — Elem/Mid/High Paid, Reduced, Free (Student Lunches)
+//   H/I        — Staff, Adult (Staff & Adult Lunches)
+//   L2/M2      — Month name / Year
+// Every =SUM() formula, the Total row, merged headers, and all original formatting are left
+// exactly as they are in the template file — this function never touches them.
+async function downloadMonthlyMealCountXLSX(data, year, month) {
+  const wb = await fetchTemplateWorkbook(LUNCH_TEMPLATE_PATH);
+  const sheetName = wb.SheetNames[0];
+  const ws = wb.Sheets[sheetName];
+
+  const days = buildMonthlyMealCountDays(data, year, month);
+  const staffDays = buildMonthlyStaffAdultDays(data, year, month);
+
+  setTemplateCell(ws, 'L2', monthNameOf(month));
+  setTemplateCell(ws, 'M2', year);
 
   for (let day = 1; day <= 31; day++) {
     const r = day + 3; // day 1 -> row 4, matching the template
-    setCell('A' + r, day);
     const d = days[day - 1];
-    if (d) {
-      setCell('B' + r, d.elem);
-      setCell('C' + r, d.mid);
-      setCell('D' + r, d.high);
-      setCell('F' + r, d.reduced);
-      setCell('G' + r, d.free);
-    }
-    setCell('E' + r, 'SUM(B' + r + ':D' + r + ')', true);
-    setCell('H' + r, 'SUM(E' + r + ':G' + r + ')', true);
+    const sd = staffDays[day - 1];
+    setTemplateCell(ws, 'B' + r, d ? d.elem : null);
+    setTemplateCell(ws, 'C' + r, d ? d.mid : null);
+    setTemplateCell(ws, 'D' + r, d ? d.high : null);
+    setTemplateCell(ws, 'F' + r, d ? d.reduced : null);
+    setTemplateCell(ws, 'G' + r, d ? d.free : null);
+    setTemplateCell(ws, 'H' + r, sd ? sd.staff : null);
+    setTemplateCell(ws, 'I' + r, sd ? sd.adult : null);
   }
 
-  setCell('A35', 'Total');
-  ['B','C','D','E','F','G','H'].forEach(col => setCell(col + '35', 'SUM(' + col + '4:' + col + '34)', true));
-
-  ws['!ref'] = 'A1:L35';
-  ws['!merges'] = [
-    XLSX.utils.decode_range('B1:H1'),
-    XLSX.utils.decode_range('A1:A3'),
-    XLSX.utils.decode_range('B2:H2')
-  ];
-  ws['!cols'] = [{ wch: 14 }, { wch: 15 }, { wch: 17 }, { wch: 15 }, { wch: 11 }, { wch: 13 }, { wch: 9 }, { wch: 9 }];
-
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
-  return wb;
-}
-
-function downloadMonthlyMealCountXLSX(data, year, month) {
-  const wb = buildMonthlyMealCountWorkbook(data, year, month);
   const filename = 'lunch-count-' + year + '-' + pad2(month) + '.xlsx';
   XLSX.writeFile(wb, filename);
 }
@@ -1342,4 +1378,3 @@ function SetupRequiredScreen() {
     </div>
   );
 }
-
