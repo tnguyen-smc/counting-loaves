@@ -1428,9 +1428,9 @@ function NavBar() {
             <p className="text-xs sm:text-sm font-light text-primary-100">Counting Loaves · Lunch Counter App</p>
           </div>
         </div>
-        <a
+        
           href="/admin"
-          className="btn-touch px-4 py-2 rounded-lg font-semibold text-sm transition-fast bg-primary-700 text-white hover:bg-primary-600"
+          className="btn-touch px-4 py-2 rounded-lg font-semibold text-sm transition-fast bg-transparent border-2 border-white text-white hover:bg-white hover:text-primary-700 flex items-center justify-center text-center"
         >
           Admin Login &rarr;
         </a>
