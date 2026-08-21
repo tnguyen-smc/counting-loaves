@@ -1582,6 +1582,19 @@ function ExportPanel({ data }) {
   const [breakfastYear, setBreakfastYear] = useState(now.getFullYear());
   const [breakfastMonth, setBreakfastMonth] = useState(now.getMonth() + 1);
 
+  // Non-staff classrooms only — Staff & Adults classrooms track plain Yes/No attendance with no
+  // Hot/Sack distinction, so a per-student Hot/Sack grid doesn't apply to them.
+  const classroomOptions = useMemo(
+    () => sortClassroomsByGrade(data.classrooms.filter(c => c.type !== 'staff')),
+    [data.classrooms]
+  );
+  const [classroomYear, setClassroomYear] = useState(now.getFullYear());
+  const [classroomMonth, setClassroomMonth] = useState(now.getMonth() + 1);
+  const [classroomId, setClassroomId] = useState('');
+  const [classroomExporting, setClassroomExporting] = useState(false);
+  const [classroomExportError, setClassroomExportError] = useState('');
+  const selectedClassroom = classroomId || (classroomOptions[0] && classroomOptions[0].id) || '';
+
   const yearOptions = [];
   for (let y = now.getFullYear() - 2; y <= now.getFullYear() + 1; y++) yearOptions.push(y);
 
@@ -1596,17 +1609,41 @@ function ExportPanel({ data }) {
   const breakfastPreview = useMemo(() => buildMonthlyBreakfastCountDays(data, breakfastYear, breakfastMonth), [data, breakfastYear, breakfastMonth]);
   const breakfastDaysWithData = breakfastPreview.filter(Boolean).length;
 
-  function runExport() {
+  async function runClassroomExport() {
+    if (!selectedClassroom) { alert('Choose a classroom first.'); return; }
+    setClassroomExportError('');
+    setClassroomExporting(true);
+    try {
+      await downloadClassroomLunchXLSX(data, classroomYear, classroomMonth, selectedClassroom);
+    } catch (err) {
+      setClassroomExportError(err.message || 'Something went wrong building the export.');
+    } finally {
+      setClassroomExporting(false);
+    }
+  }
+
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState('');
+
+  async function runExport() {
     if (unverifiedDays.length > 0) {
       alert(
         'Export blocked: ' + unverifiedDays.length + ' classroom-day' + (unverifiedDays.length === 1 ? '' : 's') +
         ' in ' + monthNameOf(month) + ' ' + year + ' ' + (unverifiedDays.length === 1 ? 'has' : 'have') +
-        " a submitted Final Lunch Count that has not been verified by an admin yet. See the list below \u2014 verify " +
+        " a submitted count that has not been verified by an admin yet. See the list below \u2014 verify " +
         (unverifiedDays.length === 1 ? 'it' : 'them') + ' in Admin \u2192 Daily Verification & Finalization (Lunch tab) first.'
       );
       return;
     }
-    downloadMonthlyMealCountXLSX(data, year, month);
+    setExportError('');
+    setExporting(true);
+    try {
+      await downloadMonthlyMealCountXLSX(data, year, month);
+    } catch (err) {
+      setExportError(err.message || 'Something went wrong building the export.');
+    } finally {
+      setExporting(false);
+    }
   }
   function runBreakfastExport() {
     downloadMonthlyBreakfastCountXLSX(data, breakfastYear, breakfastMonth);
@@ -1616,11 +1653,15 @@ function ExportPanel({ data }) {
     <div>
       <h3 className="text-xl font-bold text-primary-900 mb-4">Monthly Lunch Meal Count Export</h3>
       <p className="text-sm font-light text-primary-600 mb-6">
-        Pick a month and year to download the reimbursable meal count report in the exact layout of
-        your official monthly form &mdash; Elementary / Middle / High School Paid, Reduced Price, Free,
-        and Total, one row per day, with the same live formulas. This always reflects the current
-        saved data, so anything deleted or corrected in Admin &rarr; Data Management is already
-        accounted for before you download. Staff &amp; Adults classrooms are excluded from this report.
+        Pick a month and year to download the reimbursable meal count report using your official
+        monthly form itself &mdash; Elementary / Middle / High School Paid, Reduced Price, Free, and
+        Staff &amp; Adult Lunches, one row per day, with the same live formulas, merges, and
+        formatting already built into the template. Only Hot Lunches count toward Paid / Reduced /
+        Free &mdash; a Sack Lunch isn't a reimbursable hot meal, so it's left out of those columns.
+        This always reflects the current saved data, so anything deleted or corrected in Admin
+        &rarr; Data Management is already accounted for before you download. Only classroom-days an
+        admin has actually verified are included &mdash; anything submitted but not yet verified is
+        left blank, just like the paper form.
       </p>
 
       {unverifiedDays.length > 0 && (
@@ -1655,12 +1696,17 @@ function ExportPanel({ data }) {
               {yearOptions.map(y => <option key={y} value={y}>{y}</option>)}
             </select>
           </div>
-          <PrimaryButton disabled={unverifiedDays.length > 0} onClick={runExport}>Download Monthly Report</PrimaryButton>
+          <PrimaryButton disabled={unverifiedDays.length > 0 || exporting} onClick={runExport}>
+            {exporting ? 'Preparing\u2026' : 'Download Monthly Report'}
+          </PrimaryButton>
         </div>
         <p className="text-xs font-light text-primary-500">
           {daysWithData} of {daysInMonth(year, month)} day{daysInMonth(year, month) === 1 ? '' : 's'} in {monthNameOf(month)} {year} have a submitted AND verified count so far.
           Days without a submitted count are left blank in the export, just like the paper form.
         </p>
+        {exportError && (
+          <p className="text-xs font-semibold text-rose-700 mt-2">⚠ {exportError}</p>
+        )}
       </div>
 
       <p className="text-xs font-light text-primary-400 mt-3">
@@ -1699,6 +1745,53 @@ function ExportPanel({ data }) {
           {breakfastDaysWithData} of {daysInMonth(breakfastYear, breakfastMonth)} day{daysInMonth(breakfastYear, breakfastMonth) === 1 ? '' : 's'} in {monthNameOf(breakfastMonth)} {breakfastYear} have a submitted breakfast pre-count so far.
         </p>
       </div>
+
+      <hr className="my-8 border-primary-100" />
+
+      <h3 className="text-xl font-bold text-primary-900 mb-4">Student Lunch Data by Classroom Export</h3>
+      <p className="text-sm font-light text-primary-600 mb-6">
+        Pick a classroom, month, and year to download a per-student grid &mdash; one row per
+        student starting at your template's first row, one column per day of the month, marked
+        Hot or Sack for that day. Just like the other exports, only classroom-days an admin has
+        actually verified are included; a day with no verified Final Lunch Count, or a student
+        marked absent that day, is left blank. The Total column is each student's Hot Lunch day
+        count for the month.
+      </p>
+
+      {classroomOptions.length === 0 ? (
+        <p className="text-sm font-light text-primary-500">No classrooms yet &mdash; add one in Admin &rarr; School Management &rarr; Classrooms.</p>
+      ) : (
+        <div className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
+          <div className="flex flex-wrap gap-4 items-end mb-4">
+            <div>
+              <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Classroom</label>
+              <select value={selectedClassroom} onChange={e => setClassroomId(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2">
+                {classroomOptions.map(c => <option key={c.id} value={c.id}>{classroomLabel(c)}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Month</label>
+              <select value={classroomMonth} onChange={e => setClassroomMonth(Number(e.target.value))} className="border-2 border-primary-200 rounded-xl px-3 py-2">
+                {Array.from({ length: 12 }, (_, i) => i + 1).map(m => (
+                  <option key={m} value={m}>{monthNameOf(m)}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Year</label>
+              <select value={classroomYear} onChange={e => setClassroomYear(Number(e.target.value))} className="border-2 border-primary-200 rounded-xl px-3 py-2">
+                {yearOptions.map(y => <option key={y} value={y}>{y}</option>)}
+              </select>
+            </div>
+            <PrimaryButton disabled={classroomExporting} onClick={runClassroomExport}>
+              {classroomExporting ? 'Preparing\u2026' : 'Download Classroom Report'}
+            </PrimaryButton>
+          </div>
+          {classroomExportError && (
+            <p className="text-xs font-semibold text-rose-700 mt-2">⚠ {classroomExportError}</p>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -2170,7 +2263,8 @@ function SchoolManagementPanel({ data }) {
     ['students', 'Students'],
     ['staff', 'Staff & Adults'],
     ['gradebands', 'Grade Bands'],
-    ['settings', 'Term Settings']
+    ['settings', 'Term Settings'],
+    ['promote', 'Promote Students']
   ];
   return (
     <div>
@@ -2190,6 +2284,7 @@ function SchoolManagementPanel({ data }) {
       {section === 'staff' && <StaffManagement data={data} />}
       {section === 'gradebands' && <GradeBandsPanel data={data} />}
       {section === 'settings' && <TermSettingsPanel settings={data.settings} />}
+      {section === 'promote' && <PromoteStudentsPanel data={data} />}
     </div>
   );
 }
@@ -2201,8 +2296,7 @@ function AdminPanel({ data, authUser, onLogout }) {
     ['verification', 'Verification'],
     ['schoolmgmt', 'School Management'],
     ['export', 'Export'],
-    ['datamgmt', 'Data Management'],
-    ['promote', 'Promote Students']
+    ['datamgmt', 'Data Management']
   ];
   return (
     <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
@@ -2228,7 +2322,6 @@ function AdminPanel({ data, authUser, onLogout }) {
       {tab === 'schoolmgmt' && <SchoolManagementPanel data={data} />}
       {tab === 'export' && <ExportPanel data={data} />}
       {tab === 'datamgmt' && <DataManagementTab data={data} />}
-      {tab === 'promote' && <PromoteStudentsPanel data={data} />}
     </div>
   );
 }

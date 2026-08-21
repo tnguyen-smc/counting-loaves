@@ -1080,7 +1080,73 @@ async function downloadMonthlyMealCountXLSX(data, year, month) {
   XLSX.writeFile(wb, filename);
 }
 
-/* ============================ MONTHLY BREAKFAST COUNT EXPORT ============================ */
+/* ============================ STUDENT LUNCH DATA BY CLASSROOM EXPORT ============================ */
+// Path to the per-classroom student-level template, uploaded once by the school and served as a
+// static file at the site root, same convention as LUNCH_TEMPLATE_PATH above. Layout: A1 title,
+// A2 "Student Name" with day-of-month headers 1-31 across B2:AF2 and "Total" at AG2, one student
+// per row starting at A3.
+const CLASSROOM_TEMPLATE_PATH = '/Student-Lunch-Data-by-Classroom-Template.xlsx';
+
+// For a single classroom, builds each student's day-by-day Hot/Sack Lunch status across the given
+// month. Uses ONLY classroom-days that are both submitted AND admin-verified — same verified-only
+// rule as buildMonthlyMealCountDays — so a day with no verified Final Lunch Count is left blank
+// for every student that day, rather than guessing. An absent student is also left blank for that
+// day (no lunch of either kind was actually served). `hotCount` is each student's total Hot Lunch
+// days for the month, which is what the template's "Total" column is for.
+function buildClassroomLunchGrid(data, year, month, classroomId) {
+  const numDays = daysInMonth(year, month);
+  const cls = data.classrooms.find(c => c.id === classroomId);
+  const roster = sortStudents(data.students.filter(s => s.classroomId === classroomId), 'number');
+  const rows = roster.map(s => {
+    const days = [];
+    let hotCount = 0;
+    for (let day = 1; day <= 31; day++) {
+      if (day > numDays) { days.push(null); continue; }
+      const dateStr = year + '-' + pad2(month) + '-' + pad2(day);
+      const log = data.logsById[logId(dateStr, classroomId)];
+      if (!log || !log.final || !log.final.submitted || !log.verified) { days.push(null); continue; }
+      const e = (log.final.entries && log.final.entries[s.id]) || defaultEntry();
+      if (e.absent) { days.push(null); continue; }
+      const label = e.meal === 'hot' ? 'Hot' : 'Sack';
+      if (e.meal === 'hot') hotCount++;
+      days.push(label);
+    }
+    return { student: s, days, hotCount };
+  });
+  return { cls, rows };
+}
+
+// Fills the per-classroom template (see CLASSROOM_TEMPLATE_PATH) with one row per student,
+// starting at A3, and a Hot/Sack/blank value in each day column B:AF for that month, using ONLY
+// verified data (see buildClassroomLunchGrid). Every column width, header, and title cell already
+// in the template is left as-is other than the title, which gets the classroom/month/year appended
+// so multiple downloaded reports are easy to tell apart.
+async function downloadClassroomLunchXLSX(data, year, month, classroomId) {
+  const wb = await fetchTemplateWorkbook(CLASSROOM_TEMPLATE_PATH);
+  const sheetName = wb.SheetNames[0];
+  const ws = wb.Sheets[sheetName];
+  const { cls, rows } = buildClassroomLunchGrid(data, year, month, classroomId);
+
+  const dayCols = [];
+  for (let i = 0; i < 31; i++) dayCols.push(XLSX.utils.encode_col(1 + i)); // B..AF for day 1..31
+
+  const titleSuffix = (cls ? classroomLabel(cls) : 'Classroom') + ' \u2014 ' + monthNameOf(month) + ' ' + year;
+  setTemplateCell(ws, 'A1', 'Student Lunch Data by Classroom \u2014 ' + titleSuffix);
+
+  rows.forEach((row, idx) => {
+    const r = idx + 3; // A3 is the first student row
+    setTemplateCell(ws, 'A' + r, studentName(row.student));
+    row.days.forEach((val, i) => setTemplateCell(ws, dayCols[i] + r, val));
+    setTemplateCell(ws, 'AG' + r, row.hotCount);
+  });
+
+  const lastRow = Math.max(2, 2 + rows.length);
+  ws['!ref'] = 'A1:AG' + lastRow;
+
+  const safeClsName = (cls ? (cls.grade + '-' + cls.teacher) : 'classroom').replace(/[^a-z0-9]+/gi, '_');
+  const filename = 'lunch-by-classroom-' + safeClsName + '-' + year + '-' + pad2(month) + '.xlsx';
+  XLSX.writeFile(wb, filename);
+}
 // Mirrors buildMonthlyMealCountDays, but a breakfast count taken on log.date is recorded
 // against log.breakfast.targetDate (the next school day), so days here are bucketed by
 // targetDate rather than the log document's own date.
