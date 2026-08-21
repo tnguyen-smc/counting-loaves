@@ -1544,66 +1544,48 @@ function TeacherOverview({ data, onOpenClassroom, onOpenBreakfastFinal }) {
 // screen shows many students across many classrooms and needs to stay scannable in one column.
 function BreakfastFinalCard({ student, entry, onChange, disabled }) {
   const e = entry || defaultBreakfastFinalEntry();
-  const pickedUp = !e.absent && e.meal === 'hot';
-  const noShow = !e.absent && e.meal === 'sack';
-  function set(patch) { if (!disabled) onChange({ ...e, ...patch }); }
-  // The whole row is one big tap target that flips between the two everyday outcomes (picked up /
-  // no show), so verifying a class is one tap per exception rather than hunting a small button.
-  // Absent is the rare third case, kept as a small separate control so it can't be hit by accident.
-  function toggleMain() { set({ absent: false, meal: pickedUp ? 'sack' : 'hot' }); }
-  const rowColor = e.absent ? 'bg-gray-100 border-gray-300' : (pickedUp ? 'bg-green-50 border-green-400' : 'bg-amber-50 border-amber-400');
+  const pickedUp = e.meal === 'hot';
+  function toggle() { if (!disabled) onChange({ meal: pickedUp ? 'sack' : 'hot' }); }
+  const cardColor = pickedUp ? 'bg-green-50 border-green-400' : 'bg-amber-50 border-amber-400';
   return (
-    <div className={"rounded-xl border-2 flex items-stretch overflow-hidden transition-fast " + rowColor}>
-      <button
-        type="button"
-        disabled={disabled}
-        onClick={toggleMain}
-        className="btn-touch flex-1 min-w-0 flex items-center gap-3 px-3 py-2.5 text-left"
-      >
-        <span className={"shrink-0 w-7 h-7 rounded-full flex items-center justify-center text-sm font-bold " +
-          (e.absent ? 'bg-gray-300 text-gray-600' : pickedUp ? 'bg-green-600 text-white' : 'bg-amber-500 text-white')}>
-          {e.absent ? '–' : pickedUp ? '✓' : '✕'}
-        </span>
-        <span className={"font-semibold text-primary-900 text-sm truncate " + (e.absent ? 'opacity-60' : '')}>
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={toggle}
+      className={"btn-touch w-full text-left rounded-xl border-2 p-2.5 flex items-center gap-2 transition-fast " + cardColor}
+    >
+      <span className={"shrink-0 w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold " +
+        (pickedUp ? 'bg-green-600 text-white' : 'bg-amber-500 text-white')}>
+        {pickedUp ? '✓' : '✕'}
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block font-semibold text-primary-900 text-xs truncate">
           <span className="text-primary-400 font-medium">#{student.number}</span> {student.firstName} {student.lastName}
         </span>
-        <span className={"ml-auto shrink-0 text-xs font-bold uppercase tracking-wide " +
-          (e.absent ? 'text-gray-500' : pickedUp ? 'text-green-700' : 'text-amber-700')}>
-          {e.absent ? 'Absent' : pickedUp ? 'Picked Up' : 'No Show'}
+        <span className={"block text-[11px] font-bold uppercase tracking-wide " + (pickedUp ? 'text-green-700' : 'text-amber-700')}>
+          {pickedUp ? 'Picked Up' : 'No Show'}
         </span>
-      </button>
-      <button
-        type="button"
-        disabled={disabled}
-        onClick={() => set({ absent: !e.absent })}
-        title={e.absent ? 'Undo Absent' : 'Mark Absent'}
-        className={"btn-touch shrink-0 px-3 text-xs font-bold border-l-2 transition-fast " +
-          (e.absent ? 'bg-rose-600 text-white border-rose-600' : 'bg-white/60 text-rose-600 border-rose-200 hover:bg-rose-50')}
-      >
-        {e.absent ? 'Undo' : 'Abs'}
-      </button>
-    </div>
+      </span>
+    </button>
   );
 }
 
-// Aggregated 3-column review across every classroom, mirroring the look of the Lunch Count's
+// Aggregated 2-column review across every classroom, mirroring the look of the Lunch Count's
 // ReviewScreen (colored bordered columns, stat totals, sticky submit bar) before the final
 // "Submit Breakfast Verification" writes breakfastFinal for every classroom shown at once.
 function BreakfastFinalReview({ groups, onEdit, onSubmit, dateLabel }) {
-  const pickedUp = [], noShow = [], absent = [];
+  const pickedUp = [], noShow = [];
   groups.forEach(g => {
     g.roster.forEach(s => {
       const e = (g.bf.entries && g.bf.entries[s.id]) || defaultBreakfastFinalEntry();
       const item = { student: s, cls: g.cls };
-      if (e.absent) absent.push(item);
-      else if (e.meal === 'hot') pickedUp.push(item);
+      if (e.meal === 'hot') pickedUp.push(item);
       else noShow.push(item);
     });
   });
   const columns = [
     { key: 'picked', label: 'Picked Up', items: pickedUp, color: 'border-green-300 bg-green-50' },
-    { key: 'noshow', label: 'No Show', items: noShow, color: 'border-amber-300 bg-amber-50' },
-    { key: 'absent', label: 'Absent', items: absent, color: 'border-gray-300 bg-gray-50' }
+    { key: 'noshow', label: 'No Show', items: noShow, color: 'border-amber-300 bg-amber-50' }
   ];
   return (
     <div>
@@ -1611,25 +1593,24 @@ function BreakfastFinalReview({ groups, onEdit, onSubmit, dateLabel }) {
       <h2 className="text-2xl font-bold text-primary-900 mb-1">Review Breakfast Verification</h2>
       <p className="text-primary-600 font-light mb-6">For today &middot; {dateLabel}</p>
 
-      <div className="grid grid-cols-3 gap-3 mb-6">
+      <div className="grid grid-cols-2 gap-3 mb-6">
         <StatCard label="Picked Up" value={pickedUp.length} />
         <StatCard label="No Show" value={noShow.length} />
-        <StatCard label="Absent" value={absent.length} />
       </div>
 
-      <div className="grid md:grid-cols-3 gap-4 mb-6">
+      <div className="grid md:grid-cols-2 gap-4 mb-6">
         {columns.map(col => (
           <div key={col.key} className={"rounded-2xl border-2 p-3 " + col.color}>
             <div className="flex justify-between items-center mb-3 px-1">
               <h3 className="font-bold text-primary-900 text-sm uppercase tracking-wide">{col.label}</h3>
               <span className="text-sm font-bold text-primary-900 bg-white rounded-full px-2.5 py-0.5 border border-primary-100">{col.items.length}</span>
             </div>
-            <div className="flex flex-col gap-2 min-h-[60px]">
-              {col.items.length === 0 && <p className="text-xs font-light text-primary-400 text-center py-4">No students</p>}
+            <div className="grid grid-cols-2 gap-2 min-h-[60px]">
+              {col.items.length === 0 && <p className="text-xs font-light text-primary-400 text-center py-4 col-span-2">No students</p>}
               {col.items.map(({ student, cls }) => (
-                <div key={cls.id + '_' + student.id} className="bg-white rounded-xl card-shadow border border-primary-100 p-3">
-                  <p className="font-medium text-primary-900 truncate text-sm"><span className="text-primary-400">#{student.number}</span> {student.firstName} {student.lastName}</p>
-                  <p className="text-xs font-light text-primary-500">{cls.grade}</p>
+                <div key={cls.id + '_' + student.id} className="bg-white rounded-xl card-shadow border border-primary-100 p-2.5">
+                  <p className="font-medium text-primary-900 truncate text-xs"><span className="text-primary-400">#{student.number}</span> {student.firstName} {student.lastName}</p>
+                  <p className="text-[11px] font-light text-primary-500 truncate">{cls.grade}</p>
                 </div>
               ))}
             </div>
@@ -1761,8 +1742,8 @@ function BreakfastFinalView({ data, onBack }) {
         ) : (
           <React.Fragment>
             <p className="text-sm font-light text-primary-600 mb-5 max-w-2xl">
-              Everyone starts marked <span className="font-semibold text-green-700">Picked Up</span>. Tap a row to
-              switch it to <span className="font-semibold text-amber-700">No Show</span>, or use <span className="font-semibold text-rose-600">Abs</span> for absent.
+              Everyone starts marked <span className="font-semibold text-green-700">Picked Up</span>. Tap a student to
+              switch it to <span className="font-semibold text-amber-700">No Show</span>.
             </p>
             {groups.map(g => {
               const gPicked = g.roster.filter(s => { const e = (g.bf.entries && g.bf.entries[s.id]) || defaultBreakfastFinalEntry(); return !e.absent && e.meal === 'hot'; }).length;
@@ -1784,7 +1765,7 @@ function BreakfastFinalView({ data, onBack }) {
                     </button>
                   )}
                 </div>
-                <div className="flex flex-col gap-2 max-w-2xl">
+                <div className="grid grid-cols-3 gap-2">
                   {g.roster.map(s => (
                     <BreakfastFinalCard
                       key={s.id}
