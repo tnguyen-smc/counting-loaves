@@ -719,15 +719,16 @@ async function promoteClassroom(data, fromClassroomId, toClassroomId) {
 // they've actually flipped, instead of silently claiming every untouched student as a Hot Lunch +
 // Milk Yes default the moment the classroom's log document exists.
 function tallyLiveEntries(entries, roster) {
-  let hot = 0, sack = 0, absent = 0, milkHot = 0, milkSack = 0;
+  let hot = 0, sack = 0, absent = 0, milkHot = 0, milkSack = 0, entered = 0;
   roster.forEach(s => {
     const e = entries && entries[s.id];
     if (!e) return;
+    entered++;
     if (e.absent) { absent++; return; }
     if (e.meal === 'hot') { hot++; if (e.milk === 'yes') milkHot++; }
     else if (e.meal === 'sack') { sack++; if (e.milk === 'yes') milkSack++; }
   });
-  return { hot, sack, absent, milkHot, milkSack };
+  return { hot, sack, absent, milk: milkHot + milkSack, milkHot, milkSack, entered, total: roster.length };
 }
 function computeTodayPreCountSnapshot(data) {
   const today = todayStr();
@@ -1543,39 +1544,44 @@ function TeacherOverview({ data, onOpenClassroom, onOpenBreakfastFinal }) {
 // screen shows many students across many classrooms and needs to stay scannable in one column.
 function BreakfastFinalCard({ student, entry, onChange, disabled }) {
   const e = entry || defaultBreakfastFinalEntry();
+  const pickedUp = !e.absent && e.meal === 'hot';
+  const noShow = !e.absent && e.meal === 'sack';
   function set(patch) { if (!disabled) onChange({ ...e, ...patch }); }
-  const cardColor = e.absent ? 'bg-gray-100 border-gray-300' : (e.meal === 'hot' ? 'bg-green-50 border-green-300' : 'bg-amber-50 border-amber-300');
+  // The whole row is one big tap target that flips between the two everyday outcomes (picked up /
+  // no show), so verifying a class is one tap per exception rather than hunting a small button.
+  // Absent is the rare third case, kept as a small separate control so it can't be hit by accident.
+  function toggleMain() { set({ absent: false, meal: pickedUp ? 'sack' : 'hot' }); }
+  const rowColor = e.absent ? 'bg-gray-100 border-gray-300' : (pickedUp ? 'bg-green-50 border-green-400' : 'bg-amber-50 border-amber-400');
   return (
-    <div className={"rounded-xl card-shadow p-3 border flex items-center justify-between gap-3 transition-fast " + cardColor}>
-      <p className={"font-semibold text-primary-900 text-sm truncate " + (e.absent ? 'opacity-60' : '')}>
-        <span className="text-primary-400 font-medium">#{student.number}</span> {student.firstName} {student.lastName}
-      </p>
-      <div className="flex gap-1.5 shrink-0">
-        <button
-          type="button"
-          disabled={disabled}
-          onClick={() => set({ absent: false, meal: 'hot' })}
-          className={"btn-touch px-2.5 py-1.5 rounded-lg text-xs font-semibold border-2 transition-fast " + (!e.absent && e.meal === 'hot' ? 'bg-green-600 text-white border-green-600' : 'bg-white text-primary-600 border-primary-200 hover:bg-primary-50')}
-        >
-          Picked Up
-        </button>
-        <button
-          type="button"
-          disabled={disabled}
-          onClick={() => set({ absent: false, meal: 'sack' })}
-          className={"btn-touch px-2.5 py-1.5 rounded-lg text-xs font-semibold border-2 transition-fast " + (!e.absent && e.meal === 'sack' ? 'bg-amber-500 text-white border-amber-500' : 'bg-white text-primary-600 border-primary-200 hover:bg-primary-50')}
-        >
-          No Show
-        </button>
-        <button
-          type="button"
-          disabled={disabled}
-          onClick={() => set({ absent: !e.absent })}
-          className={"btn-touch px-2.5 py-1.5 rounded-lg text-xs font-bold transition-fast " + (e.absent ? 'bg-rose-600 text-white' : 'bg-rose-50 text-rose-600 hover:bg-rose-100')}
-        >
-          {e.absent ? 'Undo Absent' : 'Absent'}
-        </button>
-      </div>
+    <div className={"rounded-xl border-2 flex items-stretch overflow-hidden transition-fast " + rowColor}>
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={toggleMain}
+        className="btn-touch flex-1 min-w-0 flex items-center gap-3 px-3 py-2.5 text-left"
+      >
+        <span className={"shrink-0 w-7 h-7 rounded-full flex items-center justify-center text-sm font-bold " +
+          (e.absent ? 'bg-gray-300 text-gray-600' : pickedUp ? 'bg-green-600 text-white' : 'bg-amber-500 text-white')}>
+          {e.absent ? '–' : pickedUp ? '✓' : '✕'}
+        </span>
+        <span className={"font-semibold text-primary-900 text-sm truncate " + (e.absent ? 'opacity-60' : '')}>
+          <span className="text-primary-400 font-medium">#{student.number}</span> {student.firstName} {student.lastName}
+        </span>
+        <span className={"ml-auto shrink-0 text-xs font-bold uppercase tracking-wide " +
+          (e.absent ? 'text-gray-500' : pickedUp ? 'text-green-700' : 'text-amber-700')}>
+          {e.absent ? 'Absent' : pickedUp ? 'Picked Up' : 'No Show'}
+        </span>
+      </button>
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => set({ absent: !e.absent })}
+        title={e.absent ? 'Undo Absent' : 'Mark Absent'}
+        className={"btn-touch shrink-0 px-3 text-xs font-bold border-l-2 transition-fast " +
+          (e.absent ? 'bg-rose-600 text-white border-rose-600' : 'bg-white/60 text-rose-600 border-rose-200 hover:bg-rose-50')}
+      >
+        {e.absent ? 'Undo' : 'Abs'}
+      </button>
     </div>
   );
 }
@@ -1648,6 +1654,10 @@ function BreakfastFinalView({ data, onBack }) {
   const [reviewing, setReviewing] = useState(false);
   const [successInfo, setSuccessInfo] = useState(false);
 
+  // This screen is opened from a tile near the BOTTOM of the Home page, and the browser preserves
+  // that scroll offset when the view swaps — landing the user mid-list. Force the top.
+  useEffect(() => { window.scrollTo(0, 0); }, []);
+
   const sortedClassrooms = useMemo(() => sortClassroomsByGrade(data.classrooms), [data.classrooms]);
 
   // One group per classroom, in K -> 8th order. A classroom only shows up here if it actually
@@ -1681,6 +1691,26 @@ function BreakfastFinalView({ data, onBack }) {
       verified: log ? log.verified : false,
       verifiedAt: log ? log.verifiedAt : null,
       breakfastFinal: newBF,
+      breakfastVerified: log ? log.breakfastVerified : false,
+      breakfastVerifiedAt: log ? log.breakfastVerifiedAt : null
+    });
+  }
+
+  // "Everyone picked up" is by far the most common outcome for a classroom, so offer it as a
+  // single tap instead of making staff confirm each student individually.
+  async function markGroupAllPickedUp(classroomId) {
+    const group = groups.find(g => g.cls.id === classroomId);
+    if (!group || group.verified) return;
+    const log = group.todayLog;
+    const newEntries = { ...group.bf.entries };
+    group.roster.forEach(s => { newEntries[s.id] = { absent: false, meal: 'hot' }; });
+    await saveLogFull(today, classroomId, {
+      pre: log ? log.pre : undefined,
+      breakfast: log ? log.breakfast : undefined,
+      final: log ? log.final : undefined,
+      verified: log ? log.verified : false,
+      verifiedAt: log ? log.verifiedAt : null,
+      breakfastFinal: { ...group.bf, entries: newEntries, sourceDate: group.bf.sourceDate || (group.sourceLog && group.sourceLog.date) },
       breakfastVerified: log ? log.breakfastVerified : false,
       breakfastVerifiedAt: log ? log.breakfastVerifiedAt : null
     });
@@ -1730,13 +1760,30 @@ function BreakfastFinalView({ data, onBack }) {
           <BreakfastFinalReview groups={groups} onEdit={() => setReviewing(false)} onSubmit={submitAll} dateLabel={formatDisplayDate(today)} />
         ) : (
           <React.Fragment>
-            {groups.map(g => (
+            <p className="text-sm font-light text-primary-600 mb-5 max-w-2xl">
+              Everyone starts marked <span className="font-semibold text-green-700">Picked Up</span>. Tap a row to
+              switch it to <span className="font-semibold text-amber-700">No Show</span>, or use <span className="font-semibold text-rose-600">Abs</span> for absent.
+            </p>
+            {groups.map(g => {
+              const gPicked = g.roster.filter(s => { const e = (g.bf.entries && g.bf.entries[s.id]) || defaultBreakfastFinalEntry(); return !e.absent && e.meal === 'hot'; }).length;
+              return (
               <div key={g.cls.id} className="mb-8">
-                <h3 className="text-lg font-bold text-primary-900 mb-3 pb-2 border-b-2 border-primary-100">
-                  {g.cls.grade} &middot; {g.cls.teacher}{' '}
-                  <span className="text-sm font-light text-primary-500">({g.roster.length} requested breakfast)</span>
-                  {g.verified && <span className="ml-2"><Badge status="Verified" /></span>}
-                </h3>
+                <div className="flex items-center justify-between gap-3 flex-wrap mb-3 pb-2 border-b-2 border-primary-100">
+                  <h3 className="text-lg font-bold text-primary-900">
+                    {g.cls.grade} &middot; {g.cls.teacher}{' '}
+                    <span className="text-sm font-light text-primary-500">({gPicked} of {g.roster.length} picked up)</span>
+                    {g.verified && <span className="ml-2"><Badge status="Verified" /></span>}
+                  </h3>
+                  {!g.verified && gPicked < g.roster.length && (
+                    <button
+                      type="button"
+                      onClick={() => markGroupAllPickedUp(g.cls.id)}
+                      className="btn-touch px-3 py-1.5 rounded-lg bg-green-600 text-white text-xs font-bold hover:bg-green-700 transition-fast"
+                    >
+                      All Picked Up
+                    </button>
+                  )}
+                </div>
                 <div className="flex flex-col gap-2 max-w-2xl">
                   {g.roster.map(s => (
                     <BreakfastFinalCard
@@ -1749,7 +1796,8 @@ function BreakfastFinalView({ data, onBack }) {
                   ))}
                 </div>
               </div>
-            ))}
+              );
+            })}
             <div className="sticky bottom-0 bg-secondary/95 backdrop-blur pt-4 pb-2 border-t border-primary-100">
               <div className="flex justify-end gap-3">
                 <GhostButton onClick={onBack}>Cancel</GhostButton>
@@ -2374,7 +2422,7 @@ function StaffAdultsWorkspace({ data, cls, onBack }) {
           message={successStudent.firstName + "'s Hot Lunch count has been saved for today."}
           topLeftLabel="Return to Staff & Adults"
           onTopLeft={() => setSuccessId(null)}
-          onDone={() => setSuccessId(null)}
+          onDone={() => { setSuccessId(null); onBack(); }}
         />
       )}
     </div>
@@ -2785,7 +2833,12 @@ function LunchVerificationTab({ data }) {
       const entries = (log && log.pre && log.pre.entries) || {};
       return tallyStaffEntries(entries, roster).submittedCount >= roster.length;
     }
-    return !!(log && log.final && log.final.submitted);
+    // Respect the admin's per-classroom stage configuration: a class with Lunch Final disabled is
+    // ready once its Pre-Count is submitted, and a class with no lunch stages at all (e.g. a
+    // breakfast-only Pre-K room) has nothing to hold verification up.
+    if (stageEnabled(cls, 'final')) return !!(log && log.final && log.final.submitted);
+    if (stageEnabled(cls, 'pre')) return !!(log && log.pre && log.pre.submitted);
+    return true;
   }
 
   async function verifyClassroom(cls) {
@@ -2852,9 +2905,22 @@ function LunchVerificationTab({ data }) {
             const roster = sortStudents(data.students.filter(s => s.classroomId === cls.id), 'number');
             const log = data.logsById[logId(dateVal, cls.id)];
             const preEntries = (log && log.pre && log.pre.entries) || {};
-            const finalEntries = (log && log.final && log.final.entries) || {};
-            const preT = isStaffCls ? tallyStaffEntries(preEntries, roster) : tallyEntries(preEntries, roster);
-            const finalT = isStaffCls ? tallyStaffEntries(finalEntries, roster) : tallyEntries(finalEntries, roster);
+            const finalEntriesRaw = (log && log.final && log.final.entries) || {};
+            // A classroom's Final Lunch Count mirrors its Pre-Count until a teacher actually edits
+            // it (see StudentClassroomWorkspace), so an empty final map means "same as pre", not
+            // "nobody eating".
+            const finalEntries = Object.keys(finalEntriesRaw).length ? finalEntriesRaw : preEntries;
+            // Which counts this classroom is actually required to take. An admin can disable any
+            // stage per classroom (e.g. a Pre-K class that only takes a breakfast count), and a
+            // disabled stage must not be summarized here at all.
+            const preEnabled = isStaffCls || stageEnabled(cls, 'pre');
+            const finalEnabled = !isStaffCls && stageEnabled(cls, 'final');
+            const breakfastEnabled = !isStaffCls && stageEnabled(cls, 'breakfast');
+            // tallyLiveEntries (not tallyEntries) so students with no recorded entry stay
+            // uncounted instead of being silently defaulted to Hot Lunch — that default-filling
+            // was why a breakfast-only classroom reported a full roster of hot lunches here.
+            const preT = isStaffCls ? tallyStaffEntries(preEntries, roster) : tallyLiveEntries(preEntries, roster);
+            const finalT = isStaffCls ? tallyStaffEntries(finalEntries, roster) : tallyLiveEntries(finalEntries, roster);
             const preAdultsCount = (log && log.pre && log.pre.adultsCount) || 0;
             const finalAdultsCount = (log && log.final && typeof log.final.adultsCount === 'number') ? log.final.adultsCount : preAdultsCount;
             const preSubmitted = !!(log && log.pre && log.pre.submitted);
@@ -2863,9 +2929,13 @@ function LunchVerificationTab({ data }) {
             // Staff & Adults classrooms have no Final Lunch Count stage: progress is measured by
             // how many staff have submitted their own individual Hot Lunch card.
             const staffAllIn = isStaffCls && roster.length > 0 && preT.submittedCount >= roster.length;
+            // With Lunch Final disabled, the Pre-Count is the last required lunch step, so a
+            // submitted Pre-Count already means this classroom is Completed.
+            const lunchDone = finalEnabled ? finalSubmitted : (preEnabled ? preSubmitted : true);
+            const lunchStarted = preSubmitted || finalSubmitted;
             const status = verified ? 'Verified' :
               isStaffCls ? (staffAllIn ? 'Completed' : (preT.submittedCount > 0 ? 'In Progress' : 'Not Started')) :
-              (finalSubmitted ? 'Completed' : (preSubmitted ? 'In Progress' : 'Not Started'));
+              (lunchDone ? 'Completed' : (lunchStarted ? 'In Progress' : 'Not Started'));
             const isCollapsed = isSectionCollapsed(collapsed, cls.id);
 
             const changedStudents = (!isStaffCls && finalSubmitted) ? roster.filter(s => entryChanged(preEntries[s.id], finalEntries[s.id])) : [];
@@ -2920,22 +2990,37 @@ function LunchVerificationTab({ data }) {
                 ) : verified ? (
                   <div className="bg-purple-50 border border-purple-200 rounded-xl p-4 mb-4">
                     <p className="text-xs font-semibold text-purple-700 uppercase mb-2">Verified Final Count</p>
-                    <p className="font-bold text-primary-900 text-sm leading-snug">Hot: {finalT.hot}</p>
-                    <p className="font-bold text-primary-900 text-sm leading-snug">Sack: {finalT.sack}</p>
-                    <p className="font-bold text-primary-900 text-sm leading-snug">Absent: {finalT.absent}</p>
-                    <p className="font-bold text-primary-900 text-sm leading-snug">Milk: {finalT.milk}</p>
+                    {(preEnabled || finalEnabled) ? (
+                      <React.Fragment>
+                        <p className="font-bold text-primary-900 text-sm leading-snug">Hot: {finalT.hot}</p>
+                        <p className="font-bold text-primary-900 text-sm leading-snug">Sack: {finalT.sack}</p>
+                        <p className="font-bold text-primary-900 text-sm leading-snug">Absent: {finalT.absent}</p>
+                        <p className="font-bold text-primary-900 text-sm leading-snug">Milk: {finalT.milk}</p>
+                      </React.Fragment>
+                    ) : (
+                      <p className="text-sm font-light text-primary-600">No lunch count required for this classroom.</p>
+                    )}
                     <p className="font-bold text-purple-700 text-sm leading-snug mt-1">Verified</p>
                   </div>
                 ) : (
                   <div className="grid sm:grid-cols-2 gap-4 mb-4">
-                    <div className="bg-primary-50 rounded-xl p-3">
-                      <p className="text-xs font-semibold text-primary-700 uppercase mb-1">Today's Lunch Count {preSubmitted ? '' : '(not submitted)'}</p>
-                      <p className="text-sm text-primary-800">Hot {preT.hot} &middot; Sack {preT.sack} &middot; Absent {preT.absent} &middot; Milk {preT.milk}</p>
-                    </div>
-                    <div className="bg-primary-50 rounded-xl p-3">
-                      <p className="text-xs font-semibold text-primary-700 uppercase mb-1">Today's Final Lunch Count {finalSubmitted ? '' : '(not submitted)'}</p>
-                      <p className="text-sm text-primary-800">Hot {finalT.hot} &middot; Sack {finalT.sack} &middot; Absent {finalT.absent} &middot; Milk {finalT.milk}</p>
-                    </div>
+                    {preEnabled && (
+                      <div className="bg-primary-50 rounded-xl p-3">
+                        <p className="text-xs font-semibold text-primary-700 uppercase mb-1">Today's Lunch Count {preSubmitted ? '' : '(not submitted)'}</p>
+                        <p className="text-sm text-primary-800">Hot {preT.hot} &middot; Sack {preT.sack} &middot; Absent {preT.absent} &middot; Milk {preT.milk}</p>
+                      </div>
+                    )}
+                    {finalEnabled && (
+                      <div className="bg-primary-50 rounded-xl p-3">
+                        <p className="text-xs font-semibold text-primary-700 uppercase mb-1">Today's Final Lunch Count {finalSubmitted ? '' : '(not submitted)'}</p>
+                        <p className="text-sm text-primary-800">Hot {finalT.hot} &middot; Sack {finalT.sack} &middot; Absent {finalT.absent} &middot; Milk {finalT.milk}</p>
+                      </div>
+                    )}
+                    {!preEnabled && !finalEnabled && (
+                      <p className="text-sm font-light text-primary-500">
+                        No lunch count is required for this classroom{breakfastEnabled ? ' \u2014 breakfast pre-count only' : ''}. Nothing to verify here.
+                      </p>
+                    )}
                   </div>
                 )}
 
@@ -3145,24 +3230,105 @@ function BreakfastVerificationTab({ data }) {
 
 function VerificationPanel({ data }) {
   const [tab, setTab] = useState('lunch');
+  const TABS = [['lunch', "Today's Lunch"], ['breakfast', "Today's Breakfast"], ['tomorrowBreakfast', "Tomorrow's Breakfast Summary"]];
   return (
     <div>
       <h3 className="text-xl font-bold text-primary-900 mb-4">Daily Verification &amp; Finalization</h3>
-      <div className="flex bg-primary-50 rounded-xl p-1 gap-1 mb-6 w-full sm:w-auto sm:inline-flex">
-        <button
-          onClick={() => setTab('lunch')}
-          className={"btn-touch px-5 py-2 rounded-lg font-semibold text-sm transition-fast flex-1 sm:flex-initial " + (tab === 'lunch' ? 'bg-white text-primary card-shadow' : 'text-primary-600 hover:bg-white/60')}
-        >
-          Lunch
-        </button>
-        <button
-          onClick={() => setTab('breakfast')}
-          className={"btn-touch px-5 py-2 rounded-lg font-semibold text-sm transition-fast flex-1 sm:flex-initial " + (tab === 'breakfast' ? 'bg-white text-primary card-shadow' : 'text-primary-600 hover:bg-white/60')}
-        >
-          Breakfast
-        </button>
+      <div className="flex bg-primary-50 rounded-xl p-1 gap-1 mb-6 w-full sm:w-auto sm:inline-flex flex-wrap">
+        {TABS.map(([val, label]) => (
+          <button
+            key={val}
+            onClick={() => setTab(val)}
+            className={"btn-touch px-5 py-2 rounded-lg font-semibold text-sm transition-fast flex-1 sm:flex-initial " + (tab === val ? 'bg-white text-primary card-shadow' : 'text-primary-600 hover:bg-white/60')}
+          >
+            {label}
+          </button>
+        ))}
       </div>
-      {tab === 'lunch' ? <LunchVerificationTab data={data} /> : <BreakfastVerificationTab data={data} />}
+      {tab === 'lunch' && <LunchVerificationTab data={data} />}
+      {tab === 'breakfast' && <BreakfastVerificationTab data={data} />}
+      {tab === 'tomorrowBreakfast' && <TomorrowBreakfastSummaryTab data={data} />}
+    </div>
+  );
+}
+
+/* ============================ ADMIN: TOMORROW'S BREAKFAST SUMMARY (VIEW-ONLY) ============================ */
+// Read-only companion to the two verification tabs. Breakfast pre-counts are taken the school day
+// BEFORE the food is served, so this shows what each classroom has requested for the next school
+// day. There is deliberately no verify action here: the morning-of pickups get verified the next
+// day under Today's Breakfast, and pre-counts themselves are never verified.
+function TomorrowBreakfastSummaryTab({ data }) {
+  const today = todayStr();
+  const targetDate = useMemo(() => nextSchoolDay(data.settings, today), [data.settings, today]);
+  const [collapsed, setCollapsed] = useState({});
+  function toggleCollapse(id) { toggleSection(setCollapsed, id); }
+
+  const groups = useMemo(() => {
+    return sortClassroomsByGrade(data.classrooms.filter(c => c.type !== 'staff' && stageEnabled(c, 'breakfast'))).map(cls => {
+      const roster = sortStudents(data.students.filter(s => s.classroomId === cls.id), 'number');
+      const log = data.logsById[logId(today, cls.id)];
+      const entries = (log && log.breakfast && log.breakfast.entries) || {};
+      const submitted = !!(log && log.breakfast && log.breakfast.submitted);
+      const requested = roster.filter(s => { const e = entries[s.id]; return e && !e.absent && e.meal === 'hot'; });
+      return { cls, roster, requested, submitted };
+    });
+  }, [data, today]);
+
+  const totalRequested = groups.reduce((n, g) => n + g.requested.length, 0);
+  const notSubmitted = groups.filter(g => !g.submitted && g.roster.length > 0);
+
+  return (
+    <div>
+      <div className="mb-4 bg-primary-50 border border-primary-200 text-primary-700 rounded-xl p-4 text-sm font-medium">
+        Summary viewing only &mdash; there is nothing to verify here. Tomorrow's breakfast pre-count is
+        just what each classroom has requested for {formatDisplayDate(targetDate)}. Actual pickups get
+        verified the morning they happen, under Today's Breakfast.
+      </div>
+
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-6">
+        <StatCard label="Total Breakfast Requested" value={totalRequested} />
+        <StatCard label="Classrooms Submitted" value={groups.filter(g => g.submitted).length} />
+        <StatCard label="Classrooms Pending" value={notSubmitted.length} />
+      </div>
+
+      {groups.length === 0 ? (
+        <p className="text-sm font-light text-primary-500">No classrooms take a breakfast pre-count.</p>
+      ) : (
+        <div className="grid gap-4">
+          {groups.map(g => {
+            const isCollapsed = isSectionCollapsed(collapsed, g.cls.id);
+            return (
+              <div key={g.cls.id} className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
+                <div className="flex justify-between items-start flex-wrap gap-2">
+                  <div onClick={() => toggleCollapse(g.cls.id)} className="flex items-center gap-3 text-left flex-1 min-w-0 cursor-pointer">
+                    <CollapseToggle collapsed={isCollapsed} onClick={() => toggleCollapse(g.cls.id)} />
+                    <div className="min-w-0">
+                      <h4 className="font-bold text-primary-900 truncate">{classroomLabel(g.cls)}</h4>
+                      <p className="text-xs font-light text-primary-500">{g.requested.length} of {g.roster.length} requested breakfast</p>
+                    </div>
+                  </div>
+                  <Badge status={g.submitted ? 'Completed' : 'Not Started'} />
+                </div>
+                {!isCollapsed && (
+                  <div className="border-t border-primary-50 pt-3 mt-3">
+                    {g.requested.length === 0 ? (
+                      <p className="text-sm font-light text-primary-500">No students requested breakfast{g.submitted ? '' : ' yet'}.</p>
+                    ) : (
+                      <div className="flex flex-wrap gap-2">
+                        {g.requested.map(s => (
+                          <span key={s.id} className="text-sm font-medium text-primary-800 bg-primary-50 rounded-lg px-2.5 py-1">
+                            #{s.number} {s.firstName} {s.lastName}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -3182,9 +3348,9 @@ function TodaySnapshotCards({ data }) {
     <div className="grid md:grid-cols-2 gap-4 mb-8">
       <div className="bg-white rounded-2xl card-shadow border-2 border-amber-200 p-5">
         <h4 className="font-bold text-primary-900 mb-1">Today's PreCount</h4>
-        <p className="text-xs font-light text-primary-500 mb-4">Live &mdash; reflects only what teachers have actually entered so far into Today's Lunch Count, before Final Count / verification.</p>
+        <p className="text-xs font-light text-primary-500 mb-4">Live &mdash; reflects only what teachers have actually entered so far into Today's Lunch Count, before Final Count / verification. Total Hot Lunch combines student, staff, and adult hot lunches.</p>
         <div className="grid grid-cols-3 gap-3 mb-3">
-          <StatCard label="Today's Total Hot Lunch" value={pre.hot} />
+          <StatCard label="Today's Total Hot Lunch" value={pre.hot + staffAdult.staffLunch + staffAdult.adultLunch} />
           <StatCard label="Today's Sack Lunch" value={pre.sack} />
           <StatCard label="Today's Absences" value={pre.absent} />
         </div>
@@ -3192,7 +3358,8 @@ function TodaySnapshotCards({ data }) {
           <StatCard label="Hot Lunch Milk" value={pre.milkHot} />
           <StatCard label="Sack Lunch Milk" value={pre.milkSack} />
         </div>
-        <div className="grid grid-cols-2 gap-3 mb-3">
+        <div className="grid grid-cols-3 gap-3 mb-3">
+          <StatCard label="Student Hot Lunch" value={pre.hot} />
           <StatCard label="Staff Lunch" value={staffAdult.staffLunch} />
           <StatCard label="Adult Lunch" value={staffAdult.adultLunch} />
         </div>
@@ -3204,9 +3371,9 @@ function TodaySnapshotCards({ data }) {
       </div>
       <div className="bg-white rounded-2xl card-shadow border-2 border-purple-200 p-5">
         <h4 className="font-bold text-primary-900 mb-1">Today's Verified Count</h4>
-        <p className="text-xs font-light text-primary-500 mb-4">Only populates once a classroom's Final Lunch Count has been submitted AND an admin has verified it. Mirrors the same markers as Today's PreCount so the two reconcile exactly.</p>
+        <p className="text-xs font-light text-primary-500 mb-4">Only populates once a classroom's Final Lunch Count has been submitted AND an admin has verified it. Mirrors the same markers as Today's PreCount so the two reconcile exactly. Total Hot Lunch combines student, staff, and adult hot lunches.</p>
         <div className="grid grid-cols-3 gap-3 mb-3">
-          <StatCard label="Today's Total Hot Lunch" value={ver.hot} />
+          <StatCard label="Today's Total Hot Lunch" value={ver.hot + verStaffAdult.staffLunch + verStaffAdult.adultLunch} />
           <StatCard label="Today's Sack Lunch" value={ver.sack} />
           <StatCard label="Today's Absences" value={ver.absent} />
         </div>
@@ -3214,7 +3381,8 @@ function TodaySnapshotCards({ data }) {
           <StatCard label="Hot Lunch Milk" value={ver.milkHot} />
           <StatCard label="Sack Lunch Milk" value={ver.milkSack} />
         </div>
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-3 gap-3">
+          <StatCard label="Student Hot Lunch" value={ver.hot} />
           <StatCard label="Staff Lunch" value={verStaffAdult.staffLunch} />
           <StatCard label="Adult Lunch" value={verStaffAdult.adultLunch} />
         </div>
@@ -4450,7 +4618,9 @@ function DataManagementPanel({ data }) {
 // student's pre-count / breakfast / final-count entry, without touching anyone else's data for
 // that day.
 function StudentRecordEditor({ data }) {
-  const [classroomId, setClassroomId] = useState(data.classrooms[0] ? data.classrooms[0].id : '');
+  // Both selectors start empty with a "Select..." placeholder rather than silently defaulting to
+  // the first classroom/person — an admin editing a record should make both choices deliberately.
+  const [classroomId, setClassroomId] = useState('');
   const [studentId, setStudentId] = useState('');
   const [dateVal, setDateVal] = useState(todayStr());
   const [busy, setBusy] = useState(false);
@@ -4463,8 +4633,8 @@ function StudentRecordEditor({ data }) {
   const roster = useMemo(() => sortStudents(data.students.filter(s => s.classroomId === classroomId), 'number'), [data.students, classroomId]);
 
   useEffect(() => {
-    if (roster.length && !roster.some(s => s.id === studentId)) setStudentId(roster[0].id);
-    if (!roster.length) setStudentId('');
+    // Clear the person whenever the chosen classroom no longer contains them; never auto-pick.
+    if (studentId && !roster.some(s => s.id === studentId)) setStudentId('');
     // eslint-disable-next-line
   }, [classroomId, data.students]);
 
@@ -4548,8 +4718,10 @@ function StudentRecordEditor({ data }) {
         <div className="bg-primary-50 rounded-xl p-4">
           <p className="text-xs font-semibold text-primary-700 uppercase mb-2">{label}{!savedEntry && !hasPendingChanges && ' (no entry saved)'}</p>
           <div className="flex flex-wrap gap-2 mb-2">
-            <button onClick={() => setDraftFor(stageKey, { attending: true })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (e.attending ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>Yes</button>
-            <button onClick={() => setDraftFor(stageKey, { attending: false })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (!e.attending ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>No</button>
+            {/* Keep submitted:true — an admin correcting someone's answer must not silently revert
+                them to "hasn't submitted yet", which would drop them from the day's counts. */}
+            <button onClick={() => setDraftFor(stageKey, { attending: true, submitted: true })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (e.attending ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>Yes</button>
+            <button onClick={() => setDraftFor(stageKey, { attending: false, submitted: true })} className={"px-3 py-1.5 rounded-lg text-xs font-semibold border-2 " + (!e.attending ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>No</button>
             {savedEntry && <button onClick={() => clearEntry(stageKey)} className="px-3 py-1.5 rounded-lg text-xs font-semibold border-2 bg-white text-rose-600 border-rose-200">Remove Entry</button>}
           </div>
           {hasPendingChanges && (
@@ -4600,9 +4772,9 @@ function StudentRecordEditor({ data }) {
 
   return (
     <div>
-      <h3 className="text-xl font-bold text-primary-900 mb-4">Edit or Remove One Student's Record</h3>
+      <h3 className="text-xl font-bold text-primary-900 mb-4">Edit or Remove One Person's Record</h3>
       <p className="text-sm font-light text-primary-600 mb-4">
-        Fix a mistake for a single student on a single day without touching anyone else's counts.
+        Fix a mistake for a single person on a single day without touching anyone else's counts.
         Make your changes below, then tap Confirm Changes to save them. Editing the final count
         automatically un-verifies that day, so it's clear the finalized number changed.
       </p>
@@ -4610,12 +4782,14 @@ function StudentRecordEditor({ data }) {
         <div>
           <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Classroom</label>
           <select value={classroomId} onChange={e => setClassroomId(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2">
+            <option value="">Select classroom</option>
             {sortClassroomsByGrade(data.classrooms).map(c => <option key={c.id} value={c.id}>{classroomLabel(c)}</option>)}
           </select>
         </div>
         <div>
-          <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Student</label>
+          <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Person</label>
           <select value={studentId} onChange={e => setStudentId(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2">
+            <option value="">Select person</option>
             {roster.map(s => <option key={s.id} value={s.id}>{s.position ? (s.position + ' \u2013 ') : (s.number ? ('#' + s.number + ' ') : '')}{s.firstName} {s.lastName}</option>)}
           </select>
         </div>
@@ -4625,15 +4799,17 @@ function StudentRecordEditor({ data }) {
         </div>
       </div>
 
-      {!log ? (
-        <p className="text-sm font-light text-primary-500">No record exists for this classroom on {formatShortDate(dateVal)}.</p>
+      {!classroomId ? (
+        <p className="text-sm font-light text-primary-500">Select a classroom to begin.</p>
       ) : !studentId ? (
-        <p className="text-sm font-light text-primary-500">This classroom has no students yet.</p>
+        <p className="text-sm font-light text-primary-500">{roster.length === 0 ? 'This classroom has nobody assigned yet.' : 'Select a person to view or edit their record.'}</p>
+      ) : !log ? (
+        <p className="text-sm font-light text-primary-500">No record exists for this classroom on {formatShortDate(dateVal)}.</p>
       ) : (
-        <div className={"grid gap-4 " + (isStaffClassroom ? 'sm:grid-cols-2' : 'sm:grid-cols-3')}>
-          <EntryEditor label="Today's Lunch Count" savedEntry={preEntry} stageKey="pre" kind="lunch" isStaff={isStaffClassroom} />
+        <div className={"grid gap-4 " + (isStaffClassroom ? 'sm:grid-cols-1 max-w-sm' : 'sm:grid-cols-3')}>
+          <EntryEditor label={isStaffClassroom ? 'Staff Lunch Count' : "Today's Lunch Count"} savedEntry={preEntry} stageKey="pre" kind="lunch" isStaff={isStaffClassroom} />
           {!isStaffClassroom && <EntryEditor label={"Breakfast Pre-Count (for " + breakfastTargetLabel + ")"} savedEntry={breakfastEntry} stageKey="breakfast" kind="breakfast" />}
-          <EntryEditor label="Today's Final Lunch Count" savedEntry={finalEntry} stageKey="final" kind="lunch" isStaff={isStaffClassroom} />
+          {!isStaffClassroom && <EntryEditor label="Today's Final Lunch Count" savedEntry={finalEntry} stageKey="final" kind="lunch" isStaff={false} />}
         </div>
       )}
       {busy && <p className="text-xs text-primary-400 mt-2">Saving…</p>}
