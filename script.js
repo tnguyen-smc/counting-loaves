@@ -206,14 +206,17 @@ function stageEnabled(cls, stage) {
   return cls[key] !== false;
 }
 // The ordered list of stages actually offered for a classroom: Breakfast Pre-Count never applies
-// to Staff & Adults classrooms, and any stage an admin has disabled is skipped entirely (not just
-// locked) — including from the "you must submit X first" gating for the stages that remain.
+// to Staff & Adults classrooms, nor does a separate Final Lunch Count — each staff member's own
+// Hot Lunch Yes/No submission IS the definitive record for that day, so there's nothing to
+// re-confirm afterward. Any stage an admin has disabled is skipped entirely for non-staff
+// classrooms (not just locked) — including from the "you must submit X first" gating for the
+// stages that remain.
 function activeStages(cls) {
   const isStaff = !!(cls && cls.type === 'staff');
   const stages = [];
   if (stageEnabled(cls, 'pre')) stages.push('pre');
   if (!isStaff && stageEnabled(cls, 'breakfast')) stages.push('breakfast');
-  if (stageEnabled(cls, 'final')) stages.push('final');
+  if (!isStaff && stageEnabled(cls, 'final')) stages.push('final');
   return stages;
 }
 const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
@@ -292,21 +295,30 @@ function tallyEntriesSplitMilk(entries, roster, defaultEntryFn) {
   return { hot, sack, absent, milkHot, milkSack, total: roster.length };
 }
 // "Staff & Adults" classrooms use a much simpler per-person entry than students: just whether
-// that staff member is eating lunch today (yes/no), defaulting to "no" so the teacher/admin only
-// needs to flip on the people who ARE eating. No absent/sack/hot/milk options apply to staff.
-function defaultStaffEntry() { return { attending: false }; }
+// that staff member is eating lunch today (yes/no). Each staff member submits their own card
+// individually, so an entry also carries `submitted` — a roster member with no entry at all
+// simply hasn't answered yet, which is different from having answered "no".
+function defaultStaffEntry() { return { attending: false, submitted: false }; }
 function emptyStaffEntries(roster) {
   const e = {};
   roster.forEach(s => { e[s.id] = defaultStaffEntry(); });
   return e;
 }
+// yes/no/total describe the whole roster (unanswered people fall into `no`, preserving the old
+// behavior every existing caller expects). submittedYes/submittedNo/submittedCount describe only
+// the people who have actually submitted their own card, which is what the admin Analytics
+// snapshots count so that staff who never answered aren't silently reported as a real "no".
 function tallyStaffEntries(entries, roster) {
-  let yes = 0, no = 0;
+  let yes = 0, no = 0, submittedYes = 0, submittedNo = 0, submittedCount = 0;
   roster.forEach(s => {
     const e = (entries && entries[s.id]) || defaultStaffEntry();
     if (e.attending) yes++; else no++;
+    if (e.submitted) {
+      submittedCount++;
+      if (e.attending) submittedYes++; else submittedNo++;
+    }
   });
-  return { yes, no, total: roster.length };
+  return { yes, no, total: roster.length, submittedYes, submittedNo, submittedCount };
 }
 function entryChanged(preE, finalE) {
   const a = preE || defaultEntry(), b = finalE || defaultEntry();
@@ -689,46 +701,10 @@ async function promoteClassroom(data, fromClassroomId, toClassroomId) {
   return roster.length;
 }
 
-/* ============================ AGGREGATION (ANALYTICS + EXPORT) ============================ */
-// Everywhere below explicitly excludes "Staff & Adults" classrooms (cls.type === 'staff') from
-// student meal-count reporting: those classrooms track adult/staff lunches, which shouldn't be
-// mixed into student reimbursement analytics or the official Monthly Meal Count Export.
-function aggregateRange(data, startDate, endDate) {
-  const result = {};
-  data.classrooms.forEach(c => { if (c.type !== 'staff') result[c.id] = { hot: 0, sack: 0, absent: 0, milk: 0 }; });
-  data.logs.forEach(log => {
-    const d = parseDateStr(log.date);
-    if (d < startDate || d > endDate) return;
-    if (!result[log.classroomId]) return;
-    if (!log.final || !log.final.submitted) return;
-    const roster = data.students.filter(s => s.classroomId === log.classroomId);
-    const t = tallyEntries(log.final.entries, roster);
-    result[log.classroomId].hot += t.hot;
-    result[log.classroomId].sack += t.sack;
-    result[log.classroomId].absent += t.absent;
-    result[log.classroomId].milk += t.milk;
-  });
-  return result;
-}
-function aggregateRangeByStudent(data, startDate, endDate) {
-  const staffClassroomIds = new Set(data.classrooms.filter(c => c.type === 'staff').map(c => c.id));
-  const result = {};
-  data.students.forEach(s => { if (!staffClassroomIds.has(s.classroomId)) result[s.id] = { hot: 0, sack: 0, absent: 0, milk: 0 }; });
-  data.logs.forEach(log => {
-    const d = parseDateStr(log.date);
-    if (d < startDate || d > endDate) return;
-    if (!log.final || !log.final.submitted) return;
-    const roster = data.students.filter(s => s.classroomId === log.classroomId);
-    roster.forEach(s => {
-      if (!result[s.id]) return;
-      const e = (log.final.entries && log.final.entries[s.id]) || defaultEntry();
-      if (e.absent) { result[s.id].absent++; return; }
-      if (e.meal === 'hot') result[s.id].hot++; else result[s.id].sack++;
-      if (e.milk === 'yes') result[s.id].milk++;
-    });
-  });
-  return result;
-}
+/* ============================ AGGREGATION NOTE (EXPORT) ============================ */
+// Staff & Adults classrooms are explicitly excluded from student meal-count reporting below:
+// those classrooms track adult/staff lunches, which shouldn't be mixed into student
+// reimbursement analytics or the official Monthly Meal Count Export.
 
 /* ============================ TODAY SNAPSHOT (ADMIN ANALYTICS "TODAY" CARDS) ============================ */
 // Live, cross-classroom snapshot for today only, powering the two Analytics cards: a
@@ -736,34 +712,54 @@ function aggregateRangeByStudent(data, startDate, endDate) {
 // submits or verifies anything) and a Verified Count card (only counts classroom-days an admin
 // has actually verified). Staff & Adults classrooms are excluded, same reasoning as
 // aggregateRange above.
-function computeTodayPreCountSnapshot(data) {
-  const today = todayStr();
+// Tallies ONLY students who actually have a recorded entry in `entries` — unlike
+// tallyEntries/tallyEntriesSplitMilk, a missing student is simply "not yet entered" rather than
+// defaulted to Hot Lunch. This is what makes the PreCount card genuinely "live": a classroom a
+// teacher has opened but not yet touched (or not yet submitted) contributes only the students
+// they've actually flipped, instead of silently claiming every untouched student as a Hot Lunch +
+// Milk Yes default the moment the classroom's log document exists.
+function tallyLiveEntries(entries, roster) {
   let hot = 0, sack = 0, absent = 0, milkHot = 0, milkSack = 0;
-  data.classrooms.forEach(cls => {
-    if (cls.type === 'staff') return;
-    const roster = data.students.filter(s => s.classroomId === cls.id);
-    const log = data.logsById[logId(today, cls.id)];
-    const entries = (log && log.pre && log.pre.entries) || {};
-    const t = tallyEntriesSplitMilk(entries, roster, defaultEntry);
-    hot += t.hot; sack += t.sack; absent += t.absent; milkHot += t.milkHot; milkSack += t.milkSack;
+  roster.forEach(s => {
+    const e = entries && entries[s.id];
+    if (!e) return;
+    if (e.absent) { absent++; return; }
+    if (e.meal === 'hot') { hot++; if (e.milk === 'yes') milkHot++; }
+    else if (e.meal === 'sack') { sack++; if (e.milk === 'yes') milkSack++; }
   });
   return { hot, sack, absent, milkHot, milkSack };
 }
-// IMPORTANT: this must tally the *same way* computeTodayPreCountSnapshot does (split milk by
-// meal type, same fallback-entry rules) so that once a classroom is verified, "Today's Verified
-// Count" reconciles exactly against what "Today's PreCount" showed live for that classroom
-// earlier in the day — no silent unit mismatch between the two cards (e.g. one combining milk
-// into a single number while the other splits it, which made the two totals impossible to
-// reconcile even when nothing about the underlying counts had actually changed).
+function computeTodayPreCountSnapshot(data) {
+  const today = todayStr();
+  const noSchool = isNoSchoolDay(data.settings, today);
+  let hot = 0, sack = 0, absent = 0, milkHot = 0, milkSack = 0;
+  const notSubmitted = [];
+  data.classrooms.forEach(cls => {
+    if (cls.type === 'staff') return;
+    if (!stageEnabled(cls, 'pre')) return;
+    const roster = data.students.filter(s => s.classroomId === cls.id);
+    const log = data.logsById[logId(today, cls.id)];
+    const entries = (log && log.pre && log.pre.entries) || {};
+    const t = tallyLiveEntries(entries, roster);
+    hot += t.hot; sack += t.sack; absent += t.absent; milkHot += t.milkHot; milkSack += t.milkSack;
+    if (!noSchool && roster.length > 0 && !(log && log.pre && log.pre.submitted)) notSubmitted.push(classroomLabel(cls));
+  });
+  return { hot, sack, absent, milkHot, milkSack, notSubmitted };
+}
+// Only counts a classroom once its Final Lunch Count has actually been submitted AND an admin has
+// verified it — verifying a classroom that was never submitted (an admin can force this from the
+// Verification tab) leaves final.entries empty, and defaulting every missing student to Hot Lunch
+// in that case was the source of the Verified card's inflated "off" hot-lunch totals. Requiring
+// `final.submitted` closes that gap; the split-milk tally still matches the PreCount card's units.
 function computeTodayVerifiedSnapshot(data) {
   const today = todayStr();
   let hot = 0, sack = 0, absent = 0, milkHot = 0, milkSack = 0;
   data.classrooms.forEach(cls => {
     if (cls.type === 'staff') return;
     const log = data.logsById[logId(today, cls.id)];
-    if (!log || !log.verified) return;
+    if (!log || !log.verified || !(log.final && log.final.submitted)) return;
     const roster = data.students.filter(s => s.classroomId === cls.id);
-    const t = tallyEntriesSplitMilk((log.final && log.final.entries) || {}, roster, defaultEntry);
+    const t = tallyEntriesSplitMilk(log.final.entries || {}, roster, defaultEntry);
     hot += t.hot; sack += t.sack; absent += t.absent; milkHot += t.milkHot; milkSack += t.milkSack;
   });
   return { hot, sack, absent, milkHot, milkSack };
@@ -771,7 +767,9 @@ function computeTodayVerifiedSnapshot(data) {
 
 // Live snapshot of today's Staff & Adults lunch counts, for the admin "Today's PreCount" card.
 // Mirrors computeTodayPreCountSnapshot above but reads the staff Yes/No entries plus each
-// classroom's separate adults/parents counter, since those are a different shape of data.
+// classroom's separate adults/parents counter, since those are a different shape of data. Counts
+// only staff who have actually submitted their own card — a staff member who hasn't answered yet
+// is genuinely unanswered, not a "no", and shouldn't be treated as settled data either way.
 function computeTodayStaffAdultSnapshot(data) {
   const today = todayStr();
   let staffLunch = 0, adultLunch = 0;
@@ -781,16 +779,16 @@ function computeTodayStaffAdultSnapshot(data) {
     const log = data.logsById[logId(today, cls.id)];
     const entries = (log && log.pre && log.pre.entries) || {};
     const t = tallyStaffEntries(entries, roster);
-    staffLunch += t.yes;
+    staffLunch += t.submittedYes;
     if (cls.showAdultCard) adultLunch += (log && log.pre && log.pre.adultsCount) || 0;
   });
   return { staffLunch, adultLunch };
 }
 
-// Verified counterpart to computeTodayStaffAdultSnapshot: only counts a Staff & Adults
-// classroom's Final Lunch Count once an admin has verified that classroom for today, reading
-// the same final entries / adultsCount fields the Verification tab locks in. Without this, the
-// Verified Count card had no staff/adult figures at all, even though the PreCount card does.
+// Verified counterpart to computeTodayStaffAdultSnapshot. Staff & Adults classrooms have NO
+// separate Final Lunch Count — each staff member's own submitted Hot Lunch Yes/No (stored under
+// `pre`) is the definitive record for the day — so this reads pre.entries and gates purely on an
+// admin having verified the classroom, rather than looking for a final count that never exists.
 function computeTodayVerifiedStaffAdultSnapshot(data) {
   const today = todayStr();
   let staffLunch = 0, adultLunch = 0;
@@ -799,15 +797,56 @@ function computeTodayVerifiedStaffAdultSnapshot(data) {
     const log = data.logsById[logId(today, cls.id)];
     if (!log || !log.verified) return;
     const roster = data.students.filter(s => s.classroomId === cls.id);
-    const entries = (log.final && log.final.entries) || {};
+    const entries = (log.pre && log.pre.entries) || {};
     const t = tallyStaffEntries(entries, roster);
-    staffLunch += t.yes;
-    if (cls.showAdultCard) {
-      const preAdultsCount = (log.pre && log.pre.adultsCount) || 0;
-      adultLunch += (log.final && typeof log.final.adultsCount === 'number') ? log.final.adultsCount : preAdultsCount;
-    }
+    staffLunch += t.submittedYes;
+    if (cls.showAdultCard) adultLunch += (log.pre && log.pre.adultsCount) || 0;
   });
   return { staffLunch, adultLunch };
+}
+
+// Live snapshot of TOMORROW's (next school day's) Breakfast Pre-Count: how many students have
+// actually been marked as requesting breakfast so far, across every non-staff classroom whose
+// Breakfast Pre-Count is enabled. Lives on TODAY's log doc (breakfast pre-counts are taken the
+// school day before they're for), same live-only counting rule as the lunch PreCount card above.
+function computeTomorrowBreakfastPreCountSnapshot(data) {
+  const today = todayStr();
+  const noSchool = isNoSchoolDay(data.settings, today);
+  let hot = 0;
+  const notSubmitted = [];
+  data.classrooms.forEach(cls => {
+    if (cls.type === 'staff') return;
+    if (!stageEnabled(cls, 'breakfast')) return;
+    const roster = data.students.filter(s => s.classroomId === cls.id);
+    const log = data.logsById[logId(today, cls.id)];
+    const entries = (log && log.breakfast && log.breakfast.entries) || {};
+    roster.forEach(s => {
+      const e = entries[s.id];
+      if (e && !e.absent && e.meal === 'hot') hot++;
+    });
+    if (!noSchool && roster.length > 0 && !(log && log.breakfast && log.breakfast.submitted)) notSubmitted.push(classroomLabel(cls));
+  });
+  return { hot, notSubmitted };
+}
+
+// Verified snapshot of TODAY's breakfast pickups: how many students actually picked up
+// breakfast this morning, only counting a classroom once its morning-of Breakfast Verification
+// (breakfastFinal) has been submitted AND an admin has verified it (breakfastVerified).
+function computeTodayVerifiedBreakfastSnapshot(data) {
+  const today = todayStr();
+  let pickedUp = 0;
+  data.classrooms.forEach(cls => {
+    if (cls.type === 'staff') return;
+    const log = data.logsById[logId(today, cls.id)];
+    if (!log || !log.breakfastVerified || !(log.breakfastFinal && log.breakfastFinal.submitted)) return;
+    const roster = data.students.filter(s => s.classroomId === cls.id);
+    const entries = log.breakfastFinal.entries || {};
+    roster.forEach(s => {
+      const e = entries[s.id];
+      if (e && !e.absent && e.meal === 'hot') pickedUp++;
+    });
+  });
+  return { pickedUp };
 }
 
 /* ============================ MONTHLY MEAL COUNT EXPORT (matches official template) ============================ */
@@ -819,7 +858,11 @@ function computeTodayVerifiedStaffAdultSnapshot(data) {
 // leaves that day's row blank, exactly like the paper form would. Because this reads straight
 // from data.logsById / data.students (live Firestore data), anything deleted or edited in Admin
 // -> Data Management is reflected here automatically the next time this is computed.
-// Staff & Adults classrooms are excluded (see AGGREGATION note above).
+// Staff & Adults classrooms are excluded (see AGGREGATION note above). Only VERIFIED days are
+// counted — a submitted-but-unverified Final Lunch Count is left out entirely (blank row) rather
+// than populating the export with a count an admin hasn't signed off on yet. In practice the
+// Export tab's unverified-day guard already blocks running the export until everything submitted
+// is verified, but this check makes the export itself independently correct regardless of that.
 function buildMonthlyMealCountDays(data, year, month) {
   const numDays = daysInMonth(year, month);
   const days = [];
@@ -831,7 +874,7 @@ function buildMonthlyMealCountDays(data, year, month) {
     data.classrooms.forEach(cls => {
       if (cls.type === 'staff') return;
       const log = data.logsById[logId(dateStr, cls.id)];
-      if (!log || !log.final || !log.final.submitted) return;
+      if (!log || !log.final || !log.final.submitted || !log.verified) return;
       hasData = true;
       const band = bandForGrade(data.settings, cls.grade);
       const roster = data.students.filter(s => s.classroomId === cls.id);
@@ -1153,10 +1196,18 @@ function DangerButton({ children, onClick, disabled, className }) {
 // Pass `children` to replace the default single "Back to Home" button with custom navigation
 // options (see the post-Lunch-Pre-Count flow in ClassroomWorkspace) while keeping the same
 // classic green success styling.
-function SuccessModal({ title, message, onDone, children }) {
+function SuccessModal({ title, message, onDone, children, topLeftLabel, onTopLeft }) {
   return (
     <div className="fixed inset-0 bg-primary-900/50 flex items-center justify-center z-50 p-4">
-      <div className="bg-white rounded-2xl card-shadow-lg p-8 w-full max-w-sm text-center border-4 border-green-500">
+      <div className="relative bg-white rounded-2xl card-shadow-lg p-8 w-full max-w-sm text-center border-4 border-green-500">
+        {topLeftLabel && (
+          <button
+            onClick={onTopLeft}
+            className="absolute top-4 left-4 text-primary font-semibold text-xs hover:underline"
+          >
+            &larr; {topLeftLabel}
+          </button>
+        )}
         <div className="w-16 h-16 rounded-full bg-green-100 text-green-600 flex items-center justify-center text-3xl mx-auto mb-4">✓</div>
         <h2 className="text-xl font-bold text-green-700 mb-2">{title}</h2>
         <p className="text-sm font-light text-primary-600 mb-6">{message}</p>
@@ -2146,13 +2197,197 @@ function ClassroomEntryModal({ cls, isStaff, steps, preSubmitted, breakfastSubmi
   );
 }
 
+/* ============================ TEACHER: CLASSROOM WORKSPACE (DISPATCH) ============================ */
+// Staff & Adults classrooms use a completely different, per-person submission flow (see
+// StaffAdultsWorkspace below) instead of the ordered pre/breakfast/final steps students use, so
+// this just decides which real implementation to mount. No hooks live here — each real
+// implementation is its own component so hooks rules stay clean on either branch.
+function ClassroomWorkspace({ data, classroomId, onBack }) {
+  const cls = data.classrooms.find(c => c.id === classroomId);
+  if (cls && cls.type === 'staff') {
+    return <StaffAdultsWorkspace data={data} cls={cls} onBack={onBack} />;
+  }
+  return <StudentClassroomWorkspace data={data} classroomId={classroomId} onBack={onBack} />;
+}
+
+/* ============================ TEACHER: STAFF & ADULTS WORKSPACE ============================ */
+// Each staff member taps their own name/card, gets a small "Hot Lunch" Yes/No popup, and submits
+// individually — there's no ordered multi-stage flow and no separate Final Lunch Count for staff.
+// A submitted card turns yellow and shows "Submitted"; tapping it again lets them change and
+// re-submit their answer up until an admin verifies the classroom for the day.
+function StaffAdultsWorkspace({ data, cls, onBack }) {
+  const roster = data.students.filter(s => s.classroomId === cls.id);
+  const today = todayStr();
+  const todayLog = data.logsById[logId(today, cls.id)];
+  const verified = !!(todayLog && todayLog.verified);
+  const noSchool = isNoSchoolDay(data.settings, today);
+  const holiday = holidayFor(data.settings, today);
+  const showAdultCard = !!cls.showAdultCard;
+  const locked = verified || noSchool;
+
+  const [openStudentId, setOpenStudentId] = useState(null);
+  const [pendingChoice, setPendingChoice] = useState(null);
+  const [successId, setSuccessId] = useState(null);
+  const [sortBy, setSortBy] = useState('order');
+
+  function emptyBase() {
+    return {
+      pre: { entries: {}, submitted: false, submittedAt: null, adultsCount: 0 },
+      breakfast: { entries: {}, submitted: false, submittedAt: null, targetDate: nextSchoolDay(data.settings, today) },
+      final: { entries: {}, submitted: false, submittedAt: null },
+      verified: false,
+      verifiedAt: null
+    };
+  }
+
+  useEffect(() => {
+    if (!todayLog) saveLogFull(today, cls.id, emptyBase());
+    // eslint-disable-next-line
+  }, []);
+
+  const entries = (todayLog && todayLog.pre && todayLog.pre.entries) || {};
+  const adultsCount = (todayLog && todayLog.pre && todayLog.pre.adultsCount) || 0;
+  const sortedRoster = sortStudents(roster, sortBy);
+  const submittedCount = roster.filter(s => entries[s.id] && entries[s.id].submitted).length;
+  const attendingCount = roster.filter(s => entries[s.id] && entries[s.id].submitted && entries[s.id].attending).length;
+
+  function openPopup(studentId) {
+    if (locked) return;
+    const existing = entries[studentId];
+    setPendingChoice(existing && existing.submitted ? !!existing.attending : null);
+    setOpenStudentId(studentId);
+  }
+
+  async function submitEntry() {
+    if (pendingChoice === null || !openStudentId) return;
+    const base = todayLog || emptyBase();
+    const newEntries = { ...(base.pre ? base.pre.entries : {}), [openStudentId]: { attending: pendingChoice, submitted: true } };
+    await saveLogFull(today, cls.id, { ...base, pre: { ...(base.pre || emptyBase().pre), entries: newEntries } });
+    setSuccessId(openStudentId);
+    setOpenStudentId(null);
+    setPendingChoice(null);
+  }
+
+  async function updateAdultsCount(count) {
+    if (locked) return;
+    const base = todayLog || emptyBase();
+    await saveLogFull(today, cls.id, { ...base, pre: { ...(base.pre || emptyBase().pre), adultsCount: count } });
+  }
+
+  const openStudent = openStudentId ? roster.find(s => s.id === openStudentId) : null;
+  const successStudent = successId ? roster.find(s => s.id === successId) : null;
+
+  return (
+    <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
+      <div className="flex items-center justify-between mb-6 flex-wrap gap-3">
+        <div>
+          <button onClick={onBack} className="text-primary font-semibold text-sm mb-2 hover:underline">&larr; Back to Overview</button>
+          <h2 className="text-2xl font-bold text-primary-900">{cls.grade}</h2>
+          <p className="text-primary-600 font-light">{cls.teacher} &middot; {formatDisplayDate(today)}</p>
+        </div>
+        {verified && <Badge status="Verified" />}
+      </div>
+
+      {noSchool && <NoSchoolBanner label={holiday && holiday.label} />}
+
+      {verified && (
+        <div className="mb-6 bg-purple-50 border border-purple-300 text-purple-800 rounded-xl p-4 text-sm font-medium">
+          An administrator has verified and finalized today's counts for this classroom. Counts can no longer be edited.
+        </div>
+      )}
+
+      {roster.length === 0 ? (
+        <div className="bg-white rounded-2xl card-shadow p-8 text-center border border-primary-100">
+          <p className="text-primary-600 font-light">No staff assigned to this classroom yet. Ask your admin to add staff under Admin View &rarr; Staff &amp; Adults.</p>
+        </div>
+      ) : (
+        <React.Fragment>
+          {showAdultCard && (
+            <div className="mb-6">
+              <AdultsCounterCard count={adultsCount} onChange={updateAdultsCount} disabled={locked} />
+            </div>
+          )}
+
+          <p className="text-sm font-medium text-primary-600 mb-4">
+            {submittedCount} of {roster.length} submitted their own Hot Lunch count &middot; {attendingCount} eating lunch today
+          </p>
+
+          <p className="text-sm font-light text-primary-500 mb-4">Tap your name below to submit today's Hot Lunch Yes/No.</p>
+
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {sortedRoster.map(s => {
+              const e = entries[s.id];
+              const submitted = !!(e && e.submitted);
+              return (
+                <button
+                  key={s.id}
+                  type="button"
+                  onClick={() => openPopup(s.id)}
+                  disabled={locked}
+                  className={"text-left rounded-2xl card-shadow p-4 border-2 transition-fast btn-touch " +
+                    (locked ? 'opacity-60 cursor-not-allowed border-primary-100 bg-white' :
+                      submitted ? 'bg-yellow-100 border-yellow-400 hover:border-yellow-500' : 'bg-white border-primary-100 hover:border-primary-300')}
+                >
+                  <p className="font-semibold text-primary-900 truncate">
+                    {s.position ? <span className="text-primary-400 font-medium">{s.position} &middot; </span> : null}{s.firstName} {s.lastName}
+                  </p>
+                  {submitted ? (
+                    <p className="text-xs font-bold text-yellow-800 mt-1">Submitted &middot; {e.attending ? 'Hot Lunch: Yes' : 'Hot Lunch: No'}</p>
+                  ) : (
+                    <p className="text-xs font-light text-primary-500 mt-1">Tap to submit</p>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </React.Fragment>
+      )}
+
+      {openStudent && (
+        <div className="fixed inset-0 bg-primary-900/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl card-shadow-lg p-6 w-full max-w-sm">
+            <h2 className="text-xl font-bold text-primary-900 mb-1">Hot Lunch</h2>
+            <p className="text-sm font-light text-primary-600 mb-5">{openStudent.firstName} {openStudent.lastName}</p>
+            <div className="flex gap-3 mb-5">
+              {[[true,'Yes'],[false,'No']].map(([val,label]) => (
+                <button
+                  key={String(val)}
+                  type="button"
+                  onClick={() => setPendingChoice(val)}
+                  className={"flex-1 btn-touch py-3 rounded-xl font-semibold text-base border-2 transition-fast " + (pendingChoice === val ? 'bg-primary text-white border-primary' : 'bg-gray-50 text-gray-500 border-gray-200 hover:bg-gray-100')}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <div className="flex gap-3">
+              <GhostButton onClick={() => { setOpenStudentId(null); setPendingChoice(null); }}>Cancel</GhostButton>
+              <PrimaryButton disabled={pendingChoice === null} onClick={submitEntry}>Submit</PrimaryButton>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {successStudent && (
+        <SuccessModal
+          title="Lunch Count Submitted!"
+          message={successStudent.firstName + "'s Hot Lunch count has been saved for today."}
+          topLeftLabel="Return to Staff & Adults"
+          onTopLeft={() => setSuccessId(null)}
+          onDone={() => setSuccessId(null)}
+        />
+      )}
+    </div>
+  );
+}
+
 /* ============================ TEACHER: CLASSROOM WORKSPACE ============================ */
 // Enforces the required step order for every day: Today's Lunch Count -> Breakfast Pre-Count (for
-// the next school day, skipped entirely for Staff & Adults classrooms) -> Today's Final Lunch
-// Count. The final count automatically carries over the pre-count's entries until the teacher
-// changes something, exactly like before; breakfast is its own independent count each day,
-// targeting whichever day is next on the school calendar.
-function ClassroomWorkspace({ data, classroomId, onBack }) {
+// the next school day) -> Today's Final Lunch Count. The final count automatically carries over
+// the pre-count's entries until the teacher changes something, exactly like before; breakfast is
+// its own independent count each day, targeting whichever day is next on the school calendar.
+// Staff & Adults classrooms never reach this component — see StaffAdultsWorkspace above.
+function StudentClassroomWorkspace({ data, classroomId, onBack }) {
   const cls = data.classrooms.find(c => c.id === classroomId);
   const isStaff = !!(cls && cls.type === 'staff');
   const showAdultCard = isStaff && !!(cls && cls.showAdultCard);
@@ -2180,8 +2415,13 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
   useEffect(() => {
     if (!todayLog) {
       saveLogFull(today, classroomId, {
-        pre: { entries: isStaff ? emptyStaffEntries(roster) : emptyEntries(roster), submitted: false, submittedAt: null, adultsCount: 0 },
-        breakfast: { entries: emptyBreakfastEntries(roster), submitted: false, submittedAt: null, targetDate: breakfastTargetDate },
+        // NOTE: pre/breakfast entries start as a truly empty {}, same reasoning as final.entries
+        // below — if this pre-filled every student with a generic Hot Lunch default the instant a
+        // teacher merely opened the classroom (before touching or submitting anything), that
+        // default data would get written straight to Firestore and inflate the Admin Analytics
+        // "Today's PreCount" live snapshot with counts nobody actually entered.
+        pre: { entries: {}, submitted: false, submittedAt: null, adultsCount: 0 },
+        breakfast: { entries: {}, submitted: false, submittedAt: null, targetDate: breakfastTargetDate },
         // NOTE: final.entries starts as a truly empty {} — NOT emptyEntries(roster). If it were
         // pre-filled with generic default entries here, `hasOwnFinalEntries` below would see a
         // non-empty map immediately and treat that as "the teacher's own final count", so the
@@ -2200,8 +2440,14 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
 
   const locked = verified || noSchool;
 
-  const preEntries = (todayLog && todayLog.pre && todayLog.pre.entries) || (isStaff ? emptyStaffEntries(roster) : emptyEntries(roster));
-  const breakfastEntries = (todayLog && todayLog.breakfast && todayLog.breakfast.entries) || emptyBreakfastEntries(roster);
+  // Raw persisted entries (possibly partial/empty — only what teachers have actually entered so
+  // far) merged with roster-wide defaults purely for on-screen display/submission purposes. The
+  // merge happens here, in the UI layer, so what's actually stored in Firestore before a teacher
+  // submits stays a true reflection of live input (see the useEffect above and emptyBase below).
+  const preEntriesRaw = (todayLog && todayLog.pre && todayLog.pre.entries) || {};
+  const preEntries = { ...(isStaff ? emptyStaffEntries(roster) : emptyEntries(roster)), ...preEntriesRaw };
+  const breakfastEntriesRaw = (todayLog && todayLog.breakfast && todayLog.breakfast.entries) || {};
+  const breakfastEntries = { ...emptyBreakfastEntries(roster), ...breakfastEntriesRaw };
   // True only once the teacher has actually put their own data into Final (by editing a card
   // while on the Final stage, or by submitting Final at least once). Until then this stays
   // false, so `finalEntries` below live-mirrors whatever is in the Pre-Count — including any
@@ -2218,8 +2464,8 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
 
   function emptyBase() {
     return {
-      pre: { entries: isStaff ? emptyStaffEntries(roster) : emptyEntries(roster), submitted: false, submittedAt: null, adultsCount: 0 },
-      breakfast: { entries: emptyBreakfastEntries(roster), submitted: false, submittedAt: null, targetDate: breakfastTargetDate },
+      pre: { entries: {}, submitted: false, submittedAt: null, adultsCount: 0 },
+      breakfast: { entries: {}, submitted: false, submittedAt: null, targetDate: breakfastTargetDate },
       // Same reasoning as the useEffect above: keep this {} so a fresh/never-touched Final Count
       // mirrors the Pre-Count instead of generic defaults.
       final: { entries: {}, submitted: false, submittedAt: null },
@@ -2529,14 +2775,26 @@ function LunchVerificationTab({ data }) {
   function toggleExpand(id) { setExpanded(prev => ({ ...prev, [id]: !prev[id] })); }
   function toggleCollapse(id) { toggleSection(setCollapsed, id); }
 
+  // A classroom is "ready to verify" on different terms depending on its type: ordinary
+  // classrooms need a submitted Final Lunch Count, while Staff & Adults classrooms have no final
+  // stage at all — they're ready once every staff member has submitted their own Hot Lunch card.
+  function readyToVerify(cls, log) {
+    if (cls.type === 'staff') {
+      const roster = data.students.filter(s => s.classroomId === cls.id);
+      if (roster.length === 0) return false;
+      const entries = (log && log.pre && log.pre.entries) || {};
+      return tallyStaffEntries(entries, roster).submittedCount >= roster.length;
+    }
+    return !!(log && log.final && log.final.submitted);
+  }
+
   async function verifyClassroom(cls) {
     const log = data.logsById[logId(dateVal, cls.id)];
-    const finalSubmitted = !!(log && log.final && log.final.submitted);
-    if (!finalSubmitted) {
-      const proceed = confirm(
-        "Today's Final Lunch Count for " + classroomLabel(cls) + ' has not been submitted (or was not submitted properly) for ' +
-        formatDisplayDate(dateVal) + '.\n\nVerify and finalize it anyway?'
-      );
+    if (!readyToVerify(cls, log)) {
+      const what = cls.type === 'staff'
+        ? 'Not every staff member in ' + classroomLabel(cls) + ' has submitted their own lunch count'
+        : "Today's Final Lunch Count for " + classroomLabel(cls) + ' has not been submitted (or was not submitted properly)';
+      const proceed = confirm(what + ' for ' + formatDisplayDate(dateVal) + '.\n\nVerify and finalize it anyway?');
       if (!proceed) return;
     }
     await saveLogFull(dateVal, cls.id, { ...(log || {}), verified: true, verifiedAt: new Date().toISOString() });
@@ -2554,7 +2812,7 @@ function LunchVerificationTab({ data }) {
     if (unverified.length === 0) { alert('No unverified classrooms remain for this date.'); return; }
     const submitted = unverified.filter(cls => {
       const log = data.logsById[logId(dateVal, cls.id)];
-      return !!(log && log.final && log.final.submitted);
+      return readyToVerify(cls, log);
     });
     const notSubmitted = unverified.filter(cls => submitted.indexOf(cls) === -1);
 
@@ -2565,8 +2823,8 @@ function LunchVerificationTab({ data }) {
     } else {
       const names = notSubmitted.map(classroomLabel).join(', ');
       const proceed = confirm(
-        "The following classroom(s) have not submitted (or did not submit properly) Today's Final Lunch Count for " +
-        formatDisplayDate(dateVal) + ':\n\n' + names +
+        "The following classroom(s) are not fully submitted for " +
+        formatDisplayDate(dateVal) + " (ordinary classrooms are missing Today's Final Lunch Count; Staff & Adults classrooms have staff who haven't submitted their own card yet):\n\n" + names +
         '\n\nClick Cancel to leave them unverified, or OK to verify and finalize ALL ' + unverified.length + ' classroom(s) anyway, including these.'
       );
       if (!proceed) return;
@@ -2602,23 +2860,23 @@ function LunchVerificationTab({ data }) {
             const preSubmitted = !!(log && log.pre && log.pre.submitted);
             const finalSubmitted = !!(log && log.final && log.final.submitted);
             const verified = !!(log && log.verified);
-            const status = verified ? 'Verified' : (finalSubmitted ? 'Completed' : (preSubmitted ? 'In Progress' : 'Not Started'));
+            // Staff & Adults classrooms have no Final Lunch Count stage: progress is measured by
+            // how many staff have submitted their own individual Hot Lunch card.
+            const staffAllIn = isStaffCls && roster.length > 0 && preT.submittedCount >= roster.length;
+            const status = verified ? 'Verified' :
+              isStaffCls ? (staffAllIn ? 'Completed' : (preT.submittedCount > 0 ? 'In Progress' : 'Not Started')) :
+              (finalSubmitted ? 'Completed' : (preSubmitted ? 'In Progress' : 'Not Started'));
             const isCollapsed = isSectionCollapsed(collapsed, cls.id);
 
             const changedStudents = (!isStaffCls && finalSubmitted) ? roster.filter(s => entryChanged(preEntries[s.id], finalEntries[s.id])) : [];
             const summaryDiffs = [];
-            if (finalSubmitted) {
-              if (isStaffCls) {
-                if (preT.yes !== finalT.yes) summaryDiffs.push('Staff Count: ' + preT.yes + ' \u2192 ' + finalT.yes + ' (' + (finalT.yes - preT.yes > 0 ? '+' : '') + (finalT.yes - preT.yes) + ')');
-                if (cls.showAdultCard && preAdultsCount !== finalAdultsCount) summaryDiffs.push('Adult Count: ' + preAdultsCount + ' \u2192 ' + finalAdultsCount + ' (' + (finalAdultsCount - preAdultsCount > 0 ? '+' : '') + (finalAdultsCount - preAdultsCount) + ')');
-              } else {
-                [['Hot Lunch','hot'],['Sack Lunch','sack'],['Absent','absent'],['Milk','milk']].forEach(([label,key]) => {
-                  if (preT[key] !== finalT[key]) {
-                    const delta = finalT[key] - preT[key];
-                    summaryDiffs.push(label + ': ' + preT[key] + ' \u2192 ' + finalT[key] + ' (' + (delta > 0 ? '+' : '') + delta + ')');
-                  }
-                });
-              }
+            if (!isStaffCls && finalSubmitted) {
+              [['Hot Lunch','hot'],['Sack Lunch','sack'],['Absent','absent'],['Milk','milk']].forEach(([label,key]) => {
+                if (preT[key] !== finalT[key]) {
+                  const delta = finalT[key] - preT[key];
+                  summaryDiffs.push(label + ': ' + preT[key] + ' \u2192 ' + finalT[key] + ' (' + (delta > 0 ? '+' : '') + delta + ')');
+                }
+              });
             }
 
             return (
@@ -2639,21 +2897,24 @@ function LunchVerificationTab({ data }) {
                 {isStaffCls ? (
                   verified ? (
                     <div className="bg-purple-50 border border-purple-200 rounded-xl p-4 mb-4">
-                      <p className="text-xs font-semibold text-purple-700 uppercase mb-2">Verified Final Count</p>
-                      <p className="font-bold text-primary-900 text-sm leading-snug">Staff Count: {finalT.yes}</p>
-                      {cls.showAdultCard && <p className="font-bold text-primary-900 text-sm leading-snug">Adult Count: {finalAdultsCount}</p>}
+                      <p className="text-xs font-semibold text-purple-700 uppercase mb-2">Verified Staff Lunch Count</p>
+                      <p className="font-bold text-primary-900 text-sm leading-snug">Staff Count: {preT.submittedYes}</p>
+                      {cls.showAdultCard && <p className="font-bold text-primary-900 text-sm leading-snug">Adult Count: {preAdultsCount}</p>}
                       <p className="font-bold text-purple-700 text-sm leading-snug mt-1">Verified</p>
                     </div>
                   ) : (
-                    <div className="grid sm:grid-cols-2 gap-4 mb-4">
-                      <div className="bg-primary-50 rounded-xl p-3">
-                        <p className="text-xs font-semibold text-primary-700 uppercase mb-1">Today's Lunch Count {preSubmitted ? '' : '(not submitted)'}</p>
-                        <p className="text-sm text-primary-800">Staff Count {preT.yes}{cls.showAdultCard ? (' \u00b7 Adult Count ' + preAdultsCount) : ''}</p>
-                      </div>
-                      <div className="bg-primary-50 rounded-xl p-3">
-                        <p className="text-xs font-semibold text-primary-700 uppercase mb-1">Today's Final Lunch Count {finalSubmitted ? '' : '(not submitted)'}</p>
-                        <p className="text-sm text-primary-800">Staff Count {finalT.yes}{cls.showAdultCard ? (' \u00b7 Adult Count ' + finalAdultsCount) : ''}</p>
-                      </div>
+                    <div className="bg-primary-50 rounded-xl p-3 mb-4">
+                      <p className="text-xs font-semibold text-primary-700 uppercase mb-1">
+                        Staff Lunch Count {staffAllIn ? '' : '(' + (roster.length - preT.submittedCount) + ' still to submit)'}
+                      </p>
+                      <p className="text-sm text-primary-800">
+                        Staff Count {preT.submittedYes}{cls.showAdultCard ? (' \u00b7 Adult Count ' + preAdultsCount) : ''} &middot; {preT.submittedCount} of {roster.length} submitted
+                      </p>
+                      {!staffAllIn && roster.length > 0 && (
+                        <p className="text-xs font-light text-primary-500 mt-1">
+                          Not yet submitted: {roster.filter(s => !(preEntries[s.id] && preEntries[s.id].submitted)).map(s => s.firstName + ' ' + s.lastName).join(', ')}
+                        </p>
+                      )}
                     </div>
                   )
                 ) : verified ? (
@@ -2907,20 +3168,21 @@ function VerificationPanel({ data }) {
 }
 
 /* ============================ ADMIN: ANALYTICS ============================ */
-// "Today" snapshot cards: a live PreCount card (fills in as teachers work through Today's Lunch
-// Count, before anything is submitted or verified) and a Verified Count card (only shows numbers
-// for classroom-days an admin has actually verified). These sit above the date-range picker
-// since they're always about today, regardless of what range the rest of Analytics is showing.
+// "Today" snapshot cards: a live PreCount card (fills in as teachers actually enter Today's Lunch
+// Count, before anything is submitted or verified), a Verified Count card (only shows numbers for
+// classroom-days an admin has actually verified), and the breakfast counterparts of each.
 function TodaySnapshotCards({ data }) {
   const pre = useMemo(() => computeTodayPreCountSnapshot(data), [data]);
   const ver = useMemo(() => computeTodayVerifiedSnapshot(data), [data]);
   const staffAdult = useMemo(() => computeTodayStaffAdultSnapshot(data), [data]);
   const verStaffAdult = useMemo(() => computeTodayVerifiedStaffAdultSnapshot(data), [data]);
+  const breakfastPre = useMemo(() => computeTomorrowBreakfastPreCountSnapshot(data), [data]);
+  const breakfastVer = useMemo(() => computeTodayVerifiedBreakfastSnapshot(data), [data]);
   return (
     <div className="grid md:grid-cols-2 gap-4 mb-8">
       <div className="bg-white rounded-2xl card-shadow border-2 border-amber-200 p-5">
         <h4 className="font-bold text-primary-900 mb-1">Today's PreCount</h4>
-        <p className="text-xs font-light text-primary-500 mb-4">Live &mdash; fills in as teachers submit Today's Lunch Count, before Final Count / verification.</p>
+        <p className="text-xs font-light text-primary-500 mb-4">Live &mdash; reflects only what teachers have actually entered so far into Today's Lunch Count, before Final Count / verification.</p>
         <div className="grid grid-cols-3 gap-3 mb-3">
           <StatCard label="Today's Total Hot Lunch" value={pre.hot} />
           <StatCard label="Today's Sack Lunch" value={pre.sack} />
@@ -2930,14 +3192,19 @@ function TodaySnapshotCards({ data }) {
           <StatCard label="Hot Lunch Milk" value={pre.milkHot} />
           <StatCard label="Sack Lunch Milk" value={pre.milkSack} />
         </div>
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-2 gap-3 mb-3">
           <StatCard label="Staff Lunch" value={staffAdult.staffLunch} />
           <StatCard label="Adult Lunch" value={staffAdult.adultLunch} />
         </div>
+        {pre.notSubmitted.length > 0 && (
+          <p className="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+            Classes not submitted: {pre.notSubmitted.join(', ')}
+          </p>
+        )}
       </div>
       <div className="bg-white rounded-2xl card-shadow border-2 border-purple-200 p-5">
         <h4 className="font-bold text-primary-900 mb-1">Today's Verified Count</h4>
-        <p className="text-xs font-light text-primary-500 mb-4">Only populates once an admin verifies a classroom's Final Lunch Count for today. Mirrors the same markers as Today's PreCount so the two reconcile exactly.</p>
+        <p className="text-xs font-light text-primary-500 mb-4">Only populates once a classroom's Final Lunch Count has been submitted AND an admin has verified it. Mirrors the same markers as Today's PreCount so the two reconcile exactly.</p>
         <div className="grid grid-cols-3 gap-3 mb-3">
           <StatCard label="Today's Total Hot Lunch" value={ver.hot} />
           <StatCard label="Today's Sack Lunch" value={ver.sack} />
@@ -2952,137 +3219,35 @@ function TodaySnapshotCards({ data }) {
           <StatCard label="Adult Lunch" value={verStaffAdult.adultLunch} />
         </div>
       </div>
+      <div className="bg-white rounded-2xl card-shadow border-2 border-amber-200 p-5">
+        <h4 className="font-bold text-primary-900 mb-1">Tomorrow's Breakfast Pre-Count</h4>
+        <p className="text-xs font-light text-primary-500 mb-4">Live &mdash; total students precounted for breakfast so far, for the next school day.</p>
+        <StatCard label="Total Breakfast Pre-Count" value={breakfastPre.hot} />
+        {breakfastPre.notSubmitted.length > 0 && (
+          <p className="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mt-3">
+            Classes not submitted: {breakfastPre.notSubmitted.join(', ')}
+          </p>
+        )}
+      </div>
+      <div className="bg-white rounded-2xl card-shadow border-2 border-purple-200 p-5">
+        <h4 className="font-bold text-primary-900 mb-1">Today's Verified Breakfast Count</h4>
+        <p className="text-xs font-light text-primary-500 mb-4">Only populates once a classroom's morning-of Breakfast Verification has been submitted AND an admin has verified it.</p>
+        <StatCard label="Total Picked Up Breakfast" value={breakfastVer.pickedUp} />
+      </div>
     </div>
   );
 }
 
 function AnalyticsDashboard({ data }) {
-  const [range, setRange] = useState('daily');
-  const [dateVal, setDateVal] = useState(todayStr());
-  const [monthVal, setMonthVal] = useState(todayStr().slice(0,7));
-  const [termKey, setTermKey] = useState('Q1');
-  const [customStart, setCustomStart] = useState(todayStr());
-  const [customEnd, setCustomEnd] = useState(todayStr());
-  const [collapsed, setCollapsed] = useState({});
-  function toggleCollapse(id) { toggleSection(setCollapsed, id); }
-
-  let startDate, endDate, periodLabel, rangeError = null;
-
-  if (range === 'daily') {
-    startDate = parseDateStr(dateVal); endDate = parseDateStr(dateVal);
-    periodLabel = formatDisplayDate(dateVal);
-  } else if (range === 'weekly') {
-    const wr = getWeekRange(dateVal); startDate = wr.start; endDate = wr.end;
-    periodLabel = formatShortDate(toDateStr(wr.start)) + ' \u2013 ' + formatShortDate(toDateStr(wr.end));
-  } else if (range === 'monthly') {
-    const mr = getMonthRange(monthVal); startDate = mr.start; endDate = mr.end;
-    periodLabel = mr.start.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
-  } else if (range === 'quarter' || range === 'semester') {
-    const r = getTermRange(data.settings, termKey);
-    if (!r) {
-      rangeError = 'No dates set for ' + TERM_LABELS[termKey] + ' yet. Set them in Admin \u2192 Term Settings.';
-      startDate = parseDateStr(todayStr()); endDate = startDate; periodLabel = '';
-    } else {
-      startDate = r.start; endDate = r.end;
-      periodLabel = TERM_LABELS[termKey] + ': ' + formatShortDate(toDateStr(r.start)) + ' \u2013 ' + formatShortDate(toDateStr(r.end));
-    }
-  } else {
-    startDate = parseDateStr(customStart); endDate = parseDateStr(customEnd);
-    if (endDate < startDate) endDate = startDate;
-    periodLabel = formatShortDate(customStart) + ' \u2013 ' + formatShortDate(toDateStr(endDate));
-  }
-
-  const agg = useMemo(() => aggregateRange(data, startDate, endDate), [data, startDate.getTime(), endDate.getTime()]);
-  const studentAgg = useMemo(() => aggregateRangeByStudent(data, startDate, endDate), [data, startDate.getTime(), endDate.getTime()]);
-
-  const sortedClassrooms = useMemo(() => sortClassroomsByGrade(data.classrooms.filter(c => c.type !== 'staff')), [data.classrooms]);
-
   return (
     <div>
       <h3 className="text-xl font-bold text-primary-900 mb-4">Analytics &amp; Reporting</h3>
 
       <TodaySnapshotCards data={data} />
 
-      <div className="flex flex-wrap gap-2 mb-4">
-        {[['daily','Daily'],['weekly','Weekly'],['monthly','Monthly'],['quarter','This Quarter'],['semester','This Semester'],['custom','Custom Date Range']].map(([val,label]) => (
-          <button
-            key={val}
-            onClick={() => setRange(val)}
-            className={"px-4 py-2 rounded-xl font-semibold text-sm border-2 transition-fast " + (range === val ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
-          >{label}</button>
-        ))}
-      </div>
+      <hr className="my-8 border-primary-100" />
 
-      <div className="mb-6 flex items-center gap-2 flex-wrap">
-        {(range === 'daily' || range === 'weekly') && (
-          <input type="date" value={dateVal} onChange={e => setDateVal(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
-        )}
-        {range === 'monthly' && (
-          <input type="month" value={monthVal} onChange={e => setMonthVal(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
-        )}
-        {range === 'quarter' && ['Q1','Q2','Q3','Q4'].map(k => (
-          <button key={k} onClick={() => setTermKey(k)} className={"px-3 py-1.5 rounded-lg text-sm font-semibold border-2 " + (termKey === k ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>{k}</button>
-        ))}
-        {range === 'semester' && ['S1','S2'].map(k => (
-          <button key={k} onClick={() => setTermKey(k)} className={"px-3 py-1.5 rounded-lg text-sm font-semibold border-2 " + (termKey === k ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>{k}</button>
-        ))}
-        {range === 'custom' && (
-          <React.Fragment>
-            <input type="date" value={customStart} onChange={e => setCustomStart(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
-            <span className="text-sm text-primary-500">to</span>
-            <input type="date" value={customEnd} onChange={e => setCustomEnd(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
-          </React.Fragment>
-        )}
-        {!rangeError && <span className="text-sm font-light italic text-primary-500">Showing: {periodLabel}</span>}
-      </div>
-
-      {rangeError ? (
-        <div className="bg-amber-50 border border-amber-300 text-amber-800 rounded-xl p-4 text-sm font-medium mb-6">{rangeError}</div>
-      ) : (
-        <React.Fragment>
-          {sortedClassrooms.length === 0 ? (
-            <p className="text-sm font-light text-primary-500">No classrooms yet.</p>
-          ) : (
-            <div className="grid gap-4">
-              {sortedClassrooms.map(c => {
-                const v = agg[c.id] || { hot: 0, sack: 0, absent: 0, milk: 0 };
-                const roster = sortStudents(data.students.filter(s => s.classroomId === c.id), 'number');
-                const isCollapsed = isSectionCollapsed(collapsed, c.id);
-                return (
-                  <div key={c.id} className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
-                    <div className="flex justify-between items-start mb-3 flex-wrap gap-2">
-                      <div onClick={() => toggleCollapse(c.id)} className="flex items-center gap-3 text-left flex-1 min-w-0 cursor-pointer">
-                        <CollapseToggle collapsed={isCollapsed} onClick={() => toggleCollapse(c.id)} />
-                        <div className="min-w-0">
-                          <h4 className="font-bold text-primary-900 truncate">{classroomLabel(c)}</h4>
-                          <p className="text-xs font-light text-primary-500">{roster.length} students</p>
-                        </div>
-                      </div>
-                      <p className="text-sm text-primary-700 font-medium">Hot {v.hot} &middot; Sack {v.sack} &middot; Absent {v.absent} &middot; Milk {v.milk}</p>
-                    </div>
-                    {!isCollapsed && roster.length > 0 && (
-                      <div className="border-t border-primary-50 pt-3 mt-2">
-                        <p className="text-xs font-semibold text-primary-500 uppercase mb-2">Student Detail</p>
-                        <div className="divide-y divide-primary-50">
-                          {roster.map(s => {
-                            const sv = studentAgg[s.id] || { hot: 0, sack: 0, absent: 0, milk: 0 };
-                            return (
-                              <div key={s.id} className="flex items-center gap-3 py-2">
-                                <p className="font-medium text-primary-900 flex-1 min-w-0 truncate text-sm">#{s.number} {s.firstName} {s.lastName}</p>
-                                <p className="text-xs text-primary-600 font-light">Hot {sv.hot} &middot; Sack {sv.sack} &middot; Absent {sv.absent} &middot; Milk {sv.milk}</p>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </React.Fragment>
-      )}
+      <StudentRecordEditor data={data} />
     </div>
   );
 }
@@ -3868,7 +4033,7 @@ function ClassroomManagement({ data }) {
   return (
     <div>
       <h3 className="text-xl font-bold text-primary-900 mb-4">Classroom Management</h3>
-      <p className="text-sm font-light text-primary-600 mb-4">Classrooms are identified by grade and teacher. Choose Type: "Staff &amp; Adults" for a classroom that tracks staff/adult lunches instead of a student roster (Today's Lunch Count and Today's Final Lunch Count only &mdash; no breakfast).</p>
+      <p className="text-sm font-light text-primary-600 mb-4">Classrooms are identified by grade and teacher. Choose Type: "Staff &amp; Adults" for a classroom where each staff member submits their own Hot Lunch Yes/No individually (Today's Lunch Count only &mdash; no breakfast, no separate Final Lunch Count).</p>
       <form onSubmit={addClassroom} className="bg-white rounded-2xl card-shadow p-4 border border-primary-100 mb-6 flex flex-wrap gap-3 items-end">
         <div>
           <label className="text-xs font-medium text-primary-500 uppercase">Grade / Name</label>
@@ -3902,10 +4067,12 @@ function ClassroomManagement({ data }) {
               Breakfast Count
             </label>
           )}
-          <label className="flex items-center gap-1.5 text-xs font-semibold text-primary-700">
-            <input type="checkbox" checked={form.enableFinal} onChange={e => setForm({ ...form, enableFinal: e.target.checked })} />
-            Lunch Final Count
-          </label>
+          {form.type !== 'staff' && (
+            <label className="flex items-center gap-1.5 text-xs font-semibold text-primary-700">
+              <input type="checkbox" checked={form.enableFinal} onChange={e => setForm({ ...form, enableFinal: e.target.checked })} />
+              Lunch Final Count
+            </label>
+          )}
         </div>
         <PrimaryButton type="submit">Add Classroom</PrimaryButton>
       </form>
@@ -3939,10 +4106,12 @@ function ClassroomManagement({ data }) {
                       Breakfast Count
                     </label>
                   )}
-                  <label className="flex items-center gap-1.5 text-xs font-semibold text-primary-700">
-                    <input type="checkbox" checked={editForm.enableFinal} onChange={e => setEditForm({ ...editForm, enableFinal: e.target.checked })} />
-                    Lunch Final Count
-                  </label>
+                  {editForm.type !== 'staff' && (
+                    <label className="flex items-center gap-1.5 text-xs font-semibold text-primary-700">
+                      <input type="checkbox" checked={editForm.enableFinal} onChange={e => setEditForm({ ...editForm, enableFinal: e.target.checked })} />
+                      Lunch Final Count
+                    </label>
+                  )}
                 </div>
                 <div className="flex gap-2 mt-1">
                   <button onClick={() => saveEdit(c.id)} className="px-3 py-1.5 rounded-lg bg-primary text-white text-sm font-semibold">Save</button>
@@ -3981,10 +4150,12 @@ function ClassroomManagement({ data }) {
                         Breakfast Count
                       </label>
                     )}
-                    <label className="flex items-center gap-1.5 text-xs font-semibold text-primary-700">
-                      <input type="checkbox" checked={c.enableFinal !== false} onChange={() => toggleStage(c, 'enableFinal')} />
-                      Lunch Final Count
-                    </label>
+                    {c.type !== 'staff' && (
+                      <label className="flex items-center gap-1.5 text-xs font-semibold text-primary-700">
+                        <input type="checkbox" checked={c.enableFinal !== false} onChange={() => toggleStage(c, 'enableFinal')} />
+                        Lunch Final Count
+                      </label>
+                    )}
                   </div>
                 )}
               </div>
@@ -4080,7 +4251,7 @@ function ExportPanel({ data }) {
           <PrimaryButton disabled={unverifiedDays.length > 0} onClick={runExport}>Download Monthly Report</PrimaryButton>
         </div>
         <p className="text-xs font-light text-primary-500">
-          {daysWithData} of {daysInMonth(year, month)} day{daysInMonth(year, month) === 1 ? '' : 's'} in {monthNameOf(month)} {year} have a final, submitted count so far.
+          {daysWithData} of {daysInMonth(year, month)} day{daysInMonth(year, month) === 1 ? '' : 's'} in {monthNameOf(month)} {year} have a submitted AND verified count so far.
           Days without a submitted count are left blank in the export, just like the paper form.
         </p>
       </div>
@@ -4482,8 +4653,6 @@ function DataManagementTab({ data }) {
   return (
     <div>
       <DataManagementPanel data={data} />
-      <hr className="my-10 border-primary-100" />
-      <StudentRecordEditor data={data} />
     </div>
   );
 }
