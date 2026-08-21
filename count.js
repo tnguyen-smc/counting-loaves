@@ -1429,6 +1429,7 @@ function NavBar() {
           </div>
         </div>
         
+        <a
           href="/admin"
           className="btn-touch px-4 py-2 rounded-lg font-semibold text-sm transition-fast bg-transparent border-2 border-white text-white hover:bg-white hover:text-primary-700 flex items-center justify-center text-center"
         >
