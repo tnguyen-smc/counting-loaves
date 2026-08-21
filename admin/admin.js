@@ -90,11 +90,20 @@ function LunchVerificationTab({ data }) {
       if (!proceed) return;
     }
     await saveLogFull(dateVal, cls.id, { ...(log || {}), verified: true, verifiedAt: new Date().toISOString() });
+    if (cls.type !== 'staff') {
+      const roster = data.students.filter(s => s.classroomId === cls.id);
+      const finalEntries = (log && log.final && log.final.entries) || {};
+      await syncAutoDebitsForLog(dateVal, cls.id, roster, finalEntries, data.settings, true);
+    }
   }
   async function unverifyClassroom(cls) {
     const log = data.logsById[logId(dateVal, cls.id)];
     if (!log) return;
     await saveLogFull(dateVal, cls.id, { ...log, verified: false, verifiedAt: null });
+    if (cls.type !== 'staff') {
+      const roster = data.students.filter(s => s.classroomId === cls.id);
+      await syncAutoDebitsForLog(dateVal, cls.id, roster, {}, data.settings, false);
+    }
   }
   async function verifyAll() {
     const unverified = data.classrooms.filter(cls => {
@@ -125,6 +134,11 @@ function LunchVerificationTab({ data }) {
     for (const cls of toVerify) {
       const log = data.logsById[logId(dateVal, cls.id)];
       await saveLogFull(dateVal, cls.id, { ...(log || {}), verified: true, verifiedAt: new Date().toISOString() });
+      if (cls.type !== 'staff') {
+        const roster = data.students.filter(s => s.classroomId === cls.id);
+        const finalEntries = (log && log.final && log.final.entries) || {};
+        await syncAutoDebitsForLog(dateVal, cls.id, roster, finalEntries, data.settings, true);
+      }
     }
   }
 
@@ -2294,6 +2308,7 @@ function AdminPanel({ data, authUser, onLogout }) {
   const tabs = [
     ['analytics', 'Analytics'],
     ['verification', 'Verification'],
+    ['lunchaccounts', 'Lunch Accounts'],
     ['schoolmgmt', 'School Management'],
     ['export', 'Export'],
     ['datamgmt', 'Data Management']
@@ -2319,6 +2334,7 @@ function AdminPanel({ data, authUser, onLogout }) {
 
       {tab === 'analytics' && <AnalyticsDashboard data={data} />}
       {tab === 'verification' && <VerificationPanel data={data} />}
+      {tab === 'lunchaccounts' && <LunchAccountsModule data={data} authUser={authUser} />}
       {tab === 'schoolmgmt' && <SchoolManagementPanel data={data} />}
       {tab === 'export' && <ExportPanel data={data} />}
       {tab === 'datamgmt' && <DataManagementTab data={data} />}
