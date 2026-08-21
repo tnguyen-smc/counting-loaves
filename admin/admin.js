@@ -1581,8 +1581,6 @@ function ExportPanel({ data }) {
   const [month, setMonth] = useState(now.getMonth() + 1);
   const [breakfastYear, setBreakfastYear] = useState(now.getFullYear());
   const [breakfastMonth, setBreakfastMonth] = useState(now.getMonth() + 1);
-  const [exporting, setExporting] = useState(false);
-  const [exportError, setExportError] = useState('');
 
   const yearOptions = [];
   for (let y = now.getFullYear() - 2; y <= now.getFullYear() + 1; y++) yearOptions.push(y);
@@ -1591,33 +1589,24 @@ function ExportPanel({ data }) {
   const daysWithData = preview.filter(Boolean).length;
 
   // Blocks the Lunch export entirely while any classroom-day in this month has a submitted
-  // Lunch Final Count (or, for Staff & Adults classrooms, a fully submitted staff roster) that
-  // an admin hasn't verified yet — an unverified count could still change and shouldn't be
-  // locked into an official reimbursement report.
+  // Lunch Final Count that an admin hasn't verified yet — an unverified count could still
+  // change and shouldn't be locked into an official reimbursement report.
   const unverifiedDays = useMemo(() => findUnverifiedLunchDays(data, year, month), [data, year, month]);
 
   const breakfastPreview = useMemo(() => buildMonthlyBreakfastCountDays(data, breakfastYear, breakfastMonth), [data, breakfastYear, breakfastMonth]);
   const breakfastDaysWithData = breakfastPreview.filter(Boolean).length;
 
-  async function runExport() {
+  function runExport() {
     if (unverifiedDays.length > 0) {
       alert(
         'Export blocked: ' + unverifiedDays.length + ' classroom-day' + (unverifiedDays.length === 1 ? '' : 's') +
         ' in ' + monthNameOf(month) + ' ' + year + ' ' + (unverifiedDays.length === 1 ? 'has' : 'have') +
-        " a submitted count that has not been verified by an admin yet. See the list below \u2014 verify " +
+        " a submitted Final Lunch Count that has not been verified by an admin yet. See the list below \u2014 verify " +
         (unverifiedDays.length === 1 ? 'it' : 'them') + ' in Admin \u2192 Daily Verification & Finalization (Lunch tab) first.'
       );
       return;
     }
-    setExportError('');
-    setExporting(true);
-    try {
-      await downloadMonthlyMealCountXLSX(data, year, month);
-    } catch (err) {
-      setExportError(err.message || 'Something went wrong building the export.');
-    } finally {
-      setExporting(false);
-    }
+    downloadMonthlyMealCountXLSX(data, year, month);
   }
   function runBreakfastExport() {
     downloadMonthlyBreakfastCountXLSX(data, breakfastYear, breakfastMonth);
@@ -1627,13 +1616,11 @@ function ExportPanel({ data }) {
     <div>
       <h3 className="text-xl font-bold text-primary-900 mb-4">Monthly Lunch Meal Count Export</h3>
       <p className="text-sm font-light text-primary-600 mb-6">
-        Pick a month and year to download the reimbursable meal count report using your official
-        monthly form itself &mdash; Elementary / Middle / High School Paid, Reduced Price, Free, and
-        Staff &amp; Adult Lunches, one row per day, with the same live formulas, merges, and
-        formatting already built into the template. This always reflects the current saved data, so
-        anything deleted or corrected in Admin &rarr; Data Management is already accounted for before
-        you download. Only classroom-days an admin has actually verified are included &mdash; anything
-        submitted but not yet verified is left blank, just like the paper form.
+        Pick a month and year to download the reimbursable meal count report in the exact layout of
+        your official monthly form &mdash; Elementary / Middle / High School Paid, Reduced Price, Free,
+        and Total, one row per day, with the same live formulas. This always reflects the current
+        saved data, so anything deleted or corrected in Admin &rarr; Data Management is already
+        accounted for before you download. Staff &amp; Adults classrooms are excluded from this report.
       </p>
 
       {unverifiedDays.length > 0 && (
@@ -1668,17 +1655,12 @@ function ExportPanel({ data }) {
               {yearOptions.map(y => <option key={y} value={y}>{y}</option>)}
             </select>
           </div>
-          <PrimaryButton disabled={unverifiedDays.length > 0 || exporting} onClick={runExport}>
-            {exporting ? 'Preparing\u2026' : 'Download Monthly Report'}
-          </PrimaryButton>
+          <PrimaryButton disabled={unverifiedDays.length > 0} onClick={runExport}>Download Monthly Report</PrimaryButton>
         </div>
         <p className="text-xs font-light text-primary-500">
           {daysWithData} of {daysInMonth(year, month)} day{daysInMonth(year, month) === 1 ? '' : 's'} in {monthNameOf(month)} {year} have a submitted AND verified count so far.
           Days without a submitted count are left blank in the export, just like the paper form.
         </p>
-        {exportError && (
-          <p className="text-xs font-semibold text-rose-700 mt-2">⚠ {exportError}</p>
-        )}
       </div>
 
       <p className="text-xs font-light text-primary-400 mt-3">
@@ -2176,16 +2158,48 @@ function PromoteStudentsPanel({ data }) {
 }
 
 /* ============================ ADMIN PANEL ============================ */
+/* ============================ ADMIN: SCHOOL MANAGEMENT (combined tab) ============================ */
+// Combines what used to be five separate top-level Admin tabs — Classrooms, Students,
+// Staff & Adults, Grade Bands, and Term Settings — into a single "School Management" tab with its
+// own row of sub-section buttons underneath. Each section is still its own existing component;
+// only the navigation is combined, so nothing about how each section works has changed.
+function SchoolManagementPanel({ data }) {
+  const [section, setSection] = useState('classrooms');
+  const sections = [
+    ['classrooms', 'Classrooms'],
+    ['students', 'Students'],
+    ['staff', 'Staff & Adults'],
+    ['gradebands', 'Grade Bands'],
+    ['settings', 'Term Settings']
+  ];
+  return (
+    <div>
+      <h3 className="text-xl font-bold text-primary-900 mb-4">School Management</h3>
+      <div className="flex gap-2 mb-6 flex-wrap">
+        {sections.map(([val, label]) => (
+          <button
+            key={val}
+            type="button"
+            onClick={() => setSection(val)}
+            className={"btn-touch px-4 py-2 rounded-lg font-semibold text-sm transition-fast border-2 " + (section === val ? 'bg-primary-700 text-white border-primary-700' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
+          >{label}</button>
+        ))}
+      </div>
+      {section === 'classrooms' && <ClassroomManagement data={data} />}
+      {section === 'students' && <StudentManagement data={data} />}
+      {section === 'staff' && <StaffManagement data={data} />}
+      {section === 'gradebands' && <GradeBandsPanel data={data} />}
+      {section === 'settings' && <TermSettingsPanel settings={data.settings} />}
+    </div>
+  );
+}
+
 function AdminPanel({ data, authUser, onLogout }) {
   const [tab, setTab] = useState('analytics');
   const tabs = [
     ['analytics', 'Analytics'],
     ['verification', 'Verification'],
-    ['classrooms', 'Classrooms'],
-    ['students', 'Students'],
-    ['staff', 'Staff & Adults'],
-    ['gradebands', 'Grade Bands'],
-    ['settings', 'Term Settings'],
+    ['schoolmgmt', 'School Management'],
     ['export', 'Export'],
     ['datamgmt', 'Data Management'],
     ['promote', 'Promote Students']
@@ -2211,11 +2225,7 @@ function AdminPanel({ data, authUser, onLogout }) {
 
       {tab === 'analytics' && <AnalyticsDashboard data={data} />}
       {tab === 'verification' && <VerificationPanel data={data} />}
-      {tab === 'classrooms' && <ClassroomManagement data={data} />}
-      {tab === 'students' && <StudentManagement data={data} />}
-      {tab === 'staff' && <StaffManagement data={data} />}
-      {tab === 'gradebands' && <GradeBandsPanel data={data} />}
-      {tab === 'settings' && <TermSettingsPanel settings={data.settings} />}
+      {tab === 'schoolmgmt' && <SchoolManagementPanel data={data} />}
       {tab === 'export' && <ExportPanel data={data} />}
       {tab === 'datamgmt' && <DataManagementTab data={data} />}
       {tab === 'promote' && <PromoteStudentsPanel data={data} />}

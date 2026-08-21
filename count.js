@@ -361,40 +361,42 @@ function BreakfastFinalView({ data, onBack }) {
               Everyone starts marked <span className="font-semibold text-green-700">Picked Up</span>. Tap a student to
               switch it to <span className="font-semibold text-amber-700">No Show</span>.
             </p>
-            {groups.map(g => {
-              const gPicked = g.roster.filter(s => { const e = (g.bf.entries && g.bf.entries[s.id]) || defaultBreakfastFinalEntry(); return !e.absent && e.meal === 'hot'; }).length;
-              return (
-              <div key={g.cls.id} className="mb-8">
-                <div className="flex items-center justify-between gap-3 flex-wrap mb-3 pb-2 border-b-2 border-primary-100">
-                  <h3 className="text-lg font-bold text-primary-900">
-                    {g.cls.grade} &middot; {g.cls.teacher}{' '}
-                    <span className="text-sm font-light text-primary-500">({gPicked} of {g.roster.length} picked up)</span>
-                    {g.verified && <span className="ml-2"><Badge status="Verified" /></span>}
-                  </h3>
-                  {!g.verified && gPicked < g.roster.length && (
-                    <button
-                      type="button"
-                      onClick={() => markGroupAllPickedUp(g.cls.id)}
-                      className="btn-touch px-3 py-1.5 rounded-lg bg-green-600 text-white text-xs font-bold hover:bg-green-700 transition-fast"
-                    >
-                      All Picked Up
-                    </button>
-                  )}
+            <div className="grid md:grid-cols-3 gap-4">
+              {groups.map(g => {
+                const gPicked = g.roster.filter(s => { const e = (g.bf.entries && g.bf.entries[s.id]) || defaultBreakfastFinalEntry(); return !e.absent && e.meal === 'hot'; }).length;
+                return (
+                <div key={g.cls.id} className="bg-white rounded-2xl card-shadow border border-primary-100 p-3">
+                  <div className="flex items-center justify-between gap-2 flex-wrap mb-3 pb-2 border-b-2 border-primary-100">
+                    <h3 className="text-sm font-bold text-primary-900">
+                      {g.cls.grade} &middot; {g.cls.teacher}
+                      <span className="block text-xs font-light text-primary-500">({gPicked} of {g.roster.length} picked up)</span>
+                      {g.verified && <span className="inline-block mt-1"><Badge status="Verified" /></span>}
+                    </h3>
+                    {!g.verified && gPicked < g.roster.length && (
+                      <button
+                        type="button"
+                        onClick={() => markGroupAllPickedUp(g.cls.id)}
+                        className="btn-touch px-2.5 py-1.5 rounded-lg bg-green-600 text-white text-xs font-bold hover:bg-green-700 transition-fast"
+                      >
+                        All Picked Up
+                      </button>
+                    )}
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    {g.roster.map(s => (
+                      <BreakfastFinalCard
+                        key={s.id}
+                        student={s}
+                        entry={(g.bf.entries && g.bf.entries[s.id]) || defaultBreakfastFinalEntry()}
+                        onChange={(entry) => updateEntry(g.cls.id, s.id, entry)}
+                        disabled={g.verified}
+                      />
+                    ))}
+                  </div>
                 </div>
-                <div className="grid grid-cols-3 gap-2">
-                  {g.roster.map(s => (
-                    <BreakfastFinalCard
-                      key={s.id}
-                      student={s}
-                      entry={(g.bf.entries && g.bf.entries[s.id]) || defaultBreakfastFinalEntry()}
-                      onChange={(entry) => updateEntry(g.cls.id, s.id, entry)}
-                      disabled={g.verified}
-                    />
-                  ))}
-                </div>
-              </div>
-              );
-            })}
+                );
+              })}
+            </div>
             <div className="sticky bottom-0 bg-secondary/95 backdrop-blur pt-4 pb-2 border-t border-primary-100">
               <div className="flex justify-end gap-3">
                 <GhostButton onClick={onBack}>Cancel</GhostButton>
@@ -424,11 +426,11 @@ function BreakfastFinalView({ data, onBack }) {
 // ({ absent, meal, milk }) and interaction model — only the meal-option labels, the presence of
 // the Milk Choice section, and the card's color coding differ:
 //  - 'breakfast': labeled "Breakfast" / "No Breakfast" and has NO milk choice at all (breakfast
-//     only tracks status, never milk).
-//  - 'final': the Lunch Final Count card. Color-coded so a teacher scrolling a long single-column
-//     list can tell status at a glance — warm orange for Hot Lunch, blueish for Sack Lunch, and
-//     greyed-out for Absent with a distinct red "Undo Absent" box in the card's top-right corner.
-//  - 'lunch' (default, used for the Lunch Pre-Count): the original neutral white/grey styling.
+//     only tracks status, never milk). Kept on its own neutral/primary color scheme.
+//  - 'final' and 'lunch' (Today's Lunch Count and Today's Final Lunch Count): both color-coded the
+//     same way so a teacher can tell status at a glance in either view — warm orange for Hot
+//     Lunch, blueish for Sack Lunch, and greyed-out for Absent. 'final' additionally gets a
+//     distinct red "Undo Absent" box in the card's top-right corner instead of a toggle pill.
 // Staff & Adults classrooms use a plain Yes/No card: is this staff member eating lunch today?
 // No absent option, no hot/sack choice, no milk choice — just attending or not, default No.
 function StaffEntryCard({ student, entry, onChange, disabled }) {
@@ -466,9 +468,9 @@ function StudentEntryCard({ student, entry, onChange, disabled, kind, isStaff })
 
   const cardColor = e.absent
     ? 'bg-gray-100 border-gray-300'
-    : isFinal
-      ? (e.meal === 'hot' ? 'bg-orange-50 border-orange-300' : 'bg-blue-50 border-blue-300')
-      : 'bg-white border-primary-100';
+    : isBreakfast
+      ? 'bg-white border-primary-100'
+      : (e.meal === 'hot' ? 'bg-orange-50 border-orange-300' : 'bg-blue-50 border-blue-300');
 
   return (
     <div className={"relative rounded-2xl card-shadow p-4 border flex flex-col gap-3 transition-fast " + cardColor}>
@@ -515,7 +517,7 @@ function StudentEntryCard({ student, entry, onChange, disabled, kind, isStaff })
             type="button"
             disabled={disabled}
             onClick={() => setMeal('hot')}
-            className={"flex-1 btn-touch rounded-xl font-semibold text-sm transition-fast border-2 " + (e.meal === 'hot' ? (isFinal ? 'bg-orange-500 text-white border-orange-500' : 'bg-primary text-white border-primary') : 'bg-gray-50 text-gray-400 border-gray-200 hover:bg-gray-100')}
+            className={"flex-1 btn-touch rounded-xl font-semibold text-sm transition-fast border-2 " + (e.meal === 'hot' ? (isBreakfast ? 'bg-primary text-white border-primary' : 'bg-orange-500 text-white border-orange-500') : 'bg-gray-50 text-gray-400 border-gray-200 hover:bg-gray-100')}
           >
             {isBreakfast ? 'Breakfast' : 'Hot Lunch'}
           </button>
@@ -523,7 +525,7 @@ function StudentEntryCard({ student, entry, onChange, disabled, kind, isStaff })
             type="button"
             disabled={disabled}
             onClick={() => setMeal('sack')}
-            className={"flex-1 btn-touch rounded-xl font-semibold text-sm transition-fast border-2 " + (e.meal === 'sack' ? (isFinal ? 'bg-blue-500 text-white border-blue-500' : 'bg-gray-200 text-blue-700 border-gray-300') : 'bg-gray-50 text-gray-400 border-gray-200 hover:bg-gray-100')}
+            className={"flex-1 btn-touch rounded-xl font-semibold text-sm transition-fast border-2 " + (e.meal === 'sack' ? (isBreakfast ? 'bg-gray-200 text-blue-700 border-gray-300' : 'bg-blue-500 text-white border-blue-500') : 'bg-gray-50 text-gray-400 border-gray-200 hover:bg-gray-100')}
           >
             {isBreakfast ? 'No Breakfast' : 'Sack Lunch'}
           </button>
@@ -1428,10 +1430,9 @@ function NavBar() {
             <p className="text-xs sm:text-sm font-light text-primary-100">Counting Loaves · Lunch Counter App</p>
           </div>
         </div>
-        
         <a
           href="/admin"
-          className="btn-touch px-4 py-2 rounded-lg font-semibold text-sm transition-fast bg-transparent border-2 border-white text-white hover:bg-white hover:text-primary-700 flex items-center justify-center text-center"
+          className="btn-touch px-4 py-2 rounded-lg font-semibold text-sm transition-fast bg-primary-700 text-white hover:bg-primary-600"
         >
           Admin Login &rarr;
         </a>
