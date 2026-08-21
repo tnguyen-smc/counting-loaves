@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Counting Loaves | St. Mary Catholic School</title>
+<title>Admin | Counting Loaves | St. Mary Catholic School</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fira+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
 <script src="https://cdn.tailwindcss.com"></script>
@@ -43,14 +43,14 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <!-- SheetJS: reads/writes .xlsx and .csv for roster batch-upload and lunch-count export -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="../style.css">
 </head>
 <body class="bg-secondary min-h-screen text-primary-900">
 <div id="root"></div>
 
-<!-- shared.js MUST load before count.js: it defines the helpers, hooks, and
-     shared UI atoms that count.js depends on. -->
-<script type="text/babel" data-presets="react" src="shared.js"></script>
-<script type="text/babel" data-presets="react" src="count.js"></script>
+<!-- shared.js MUST load before admin.js: it defines the helpers, hooks, and
+     shared UI atoms that admin.js depends on. -->
+<script type="text/babel" data-presets="react" src="../shared.js"></script>
+<script type="text/babel" data-presets="react" src="admin.js"></script>
 </body>
 </html>
