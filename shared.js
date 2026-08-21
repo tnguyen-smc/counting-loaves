@@ -885,6 +885,10 @@ function computeTodayVerifiedBreakfastSnapshot(data) {
 // than populating the export with a count an admin hasn't signed off on yet. In practice the
 // Export tab's unverified-day guard already blocks running the export until everything submitted
 // is verified, but this check makes the export itself independently correct regardless of that.
+// Only HOT lunches count toward the reimbursement report — a student marked Sack Lunch didn't
+// take a reimbursable hot meal that day, same as breakfast's `e.meal !== 'hot'` check below. This
+// keeps the export's Total (E+F+G) equal to "Today's Verified Count" -> Student Hot Lunch for any
+// day it's checked against, rather than double-counting sack lunches into Paid/Reduced/Free.
 function buildMonthlyMealCountDays(data, year, month) {
   const numDays = daysInMonth(year, month);
   const days = [];
@@ -903,6 +907,7 @@ function buildMonthlyMealCountDays(data, year, month) {
       roster.forEach(s => {
         const e = (log.final.entries && log.final.entries[s.id]) || defaultEntry();
         if (e.absent) return;
+        if (e.meal !== 'hot') return; // Sack Lunch isn't part of the reimbursable hot lunch count
         const status = s.lunchStatus || 'paid';
         if (status === 'free') { counts.free++; return; }
         if (status === 'reduced') { counts.reduced++; return; }
