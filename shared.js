@@ -1003,15 +1003,29 @@ function setTemplateCell(ws, addr, value) {
   ws[addr] = (typeof value === 'string') ? { t: 's', v: value } : { t: 'n', v: value };
 }
 
+// Sets a formula cell but ALSO bakes in the correct computed value as its cached result. This
+// matters because the free/CDN build of SheetJS cannot write the workbook's <calcPr> element (so
+// fullCalcOnLoad can't be set), which means whatever cached value a formula cell already has when
+// read keeps showing until something forces a recalculation — inconsistent across Excel, Google
+// Sheets, and quick-look previews. The template's formula cells start with a cached 0 (from the
+// blank form), so without this, every Total Paid / Total / bottom Total cell would keep showing
+// 0 instead of the real sum until the user forced a manual recalculation. Baking in the correct
+// value here means the numbers are right the instant the file opens, while the formula itself is
+// left in place so the cell still recalculates normally if the school edits a number by hand later.
+function setFormulaCell(ws, addr, formula, value) {
+  ws[addr] = { t: 'n', f: formula, v: value };
+}
+
 // Fills the official template (see LUNCH_TEMPLATE_PATH) with this month's data, using ONLY
 // classroom-days that are both submitted AND admin-verified (buildMonthlyMealCountDays /
 // buildMonthlyStaffAdultDays already enforce this — an unverified submitted count is left blank
-// rather than exported). Populates just the data cells the template expects real data in:
+// rather than exported). Populates:
 //   B/C/D/F/G  — Elem/Mid/High Paid, Reduced, Free (Student Lunches)
 //   H/I        — Staff, Adult (Staff & Adult Lunches)
 //   L2/M2      — Month name / Year
-// Every =SUM() formula, the Total row, merged headers, and all original formatting are left
-// exactly as they are in the template file — this function never touches them.
+//   E/J        — Total Paid / Total per row, and the bottom Total row (still =SUM() formulas,
+//                but see setFormulaCell above for why their cached values are recomputed too)
+// Every merge, border, font, and column width from the original template is left exactly as-is.
 async function downloadMonthlyMealCountXLSX(data, year, month) {
   const wb = await fetchTemplateWorkbook(LUNCH_TEMPLATE_PATH);
   const sheetName = wb.SheetNames[0];
@@ -1023,18 +1037,39 @@ async function downloadMonthlyMealCountXLSX(data, year, month) {
   setTemplateCell(ws, 'L2', monthNameOf(month));
   setTemplateCell(ws, 'M2', year);
 
+  const colTotals = { B: 0, C: 0, D: 0, E: 0, F: 0, G: 0, H: 0, I: 0 };
+
   for (let day = 1; day <= 31; day++) {
     const r = day + 3; // day 1 -> row 4, matching the template
     const d = days[day - 1];
     const sd = staffDays[day - 1];
-    setTemplateCell(ws, 'B' + r, d ? d.elem : null);
-    setTemplateCell(ws, 'C' + r, d ? d.mid : null);
-    setTemplateCell(ws, 'D' + r, d ? d.high : null);
-    setTemplateCell(ws, 'F' + r, d ? d.reduced : null);
-    setTemplateCell(ws, 'G' + r, d ? d.free : null);
-    setTemplateCell(ws, 'H' + r, sd ? sd.staff : null);
-    setTemplateCell(ws, 'I' + r, sd ? sd.adult : null);
+    const elem = d ? d.elem : null, mid = d ? d.mid : null, high = d ? d.high : null;
+    const reduced = d ? d.reduced : null, free = d ? d.free : null;
+    const staff = sd ? sd.staff : null, adult = sd ? sd.adult : null;
+
+    setTemplateCell(ws, 'B' + r, elem);
+    setTemplateCell(ws, 'C' + r, mid);
+    setTemplateCell(ws, 'D' + r, high);
+    setTemplateCell(ws, 'F' + r, reduced);
+    setTemplateCell(ws, 'G' + r, free);
+    setTemplateCell(ws, 'H' + r, staff);
+    setTemplateCell(ws, 'I' + r, adult);
+
+    const totalPaid = (elem || 0) + (mid || 0) + (high || 0);
+    const total = totalPaid + (reduced || 0) + (free || 0) + (staff || 0) + (adult || 0);
+    setFormulaCell(ws, 'E' + r, 'SUM(B' + r + ':D' + r + ')', totalPaid);
+    setFormulaCell(ws, 'J' + r, 'SUM(E' + r + ':I' + r + ')', total);
+
+    colTotals.B += elem || 0; colTotals.C += mid || 0; colTotals.D += high || 0;
+    colTotals.E += totalPaid; colTotals.F += reduced || 0; colTotals.G += free || 0;
+    colTotals.H += staff || 0; colTotals.I += adult || 0;
   }
+
+  ['B','C','D','E','F','G','H','I'].forEach(col => {
+    setFormulaCell(ws, col + '35', 'SUM(' + col + '4:' + col + '34)', colTotals[col]);
+  });
+  const grandTotal = colTotals.E + colTotals.F + colTotals.G + colTotals.H + colTotals.I;
+  setFormulaCell(ws, 'J35', 'SUM(E35:I35)', grandTotal);
 
   const filename = 'lunch-count-' + year + '-' + pad2(month) + '.xlsx';
   XLSX.writeFile(wb, filename);
